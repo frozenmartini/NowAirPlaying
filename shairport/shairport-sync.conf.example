@@ -1,0 +1,40 @@
+// shairport-sync v5 config. Copy to ~/.config/shairport-sync.conf and chmod 600
+// (it holds the MQTT password). The user unit runs it with
+//   /usr/local/bin/shairport-sync -c %h/.config/shairport-sync.conf
+//
+// When upgrading shairport-sync, start from its own sample config: v5 renamed
+// settings compared with v4.
+
+general =
+{
+  name = "Now AirPlaying";       // the name iPhones show in the AirPlay picker
+  output_backend = "pipewire";   // audio -> user PipeWire session -> default sink (the amp)
+  service_type = "airplay2";     // never "auto": auto silently downgrades to classic AirPlay 1
+                                 // when nqptp's shared memory isn't up yet at boot (the user
+                                 // unit races the system nqptp unit). Explicit airplay2 makes
+                                 // shairport exit instead, and Restart=on-failure retries it
+                                 // once nqptp is up.
+};
+
+metadata =
+{
+  enabled = "yes";
+};
+
+mqtt =
+{
+  enabled = "yes";
+  hostname = "homeassistant.local";
+  port = 1883;
+  username = "CHANGE-ME";
+  password = "CHANGE-ME";
+  topic = "nowairplaying/airplay";  // <mqtt.base_topic>/airplay from speakerd's config
+  publish_parsed = "yes";        // per-key subtopics: title, artist, active, playing, ...
+  publish_retain = "yes";        // lets speakerd rehydrate AirPlay state after a restart
+  enable_remote = "yes";         // accepts playpause/nextitem/previtem on .../airplay/remote
+  // enable_autodiscovery stays OFF: speakerd owns HA discovery (one device)
+};
+
+// Do NOT enable shairport's MPRIS interface. speakerd already exports the
+// metadata to the amp through one permanent player; a second MPRIS player on
+// the bus is exactly the failure that design removes.

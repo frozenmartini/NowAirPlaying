@@ -1,0 +1,415 @@
+"""BlueZ system-bus engine.
+
+Purely event-driven: one ObjectManager scan at startup (and after a
+bluetoothd restart), then D-Bus signals only. Object paths for transports
+and players churn on every reconnect, so nothing below caches a path beyond
+its InterfacesRemoved.
+
+Publishing goes through a `sink` object providing:
+    device_changed(slug: str, connected: bool)
+    streaming_changed(on: bool)            # already debounced here
+    now_playing_changed(payload: dict)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+
+from dbus_next import BusType, Message, MessageType
+from dbus_next.aio import MessageBus
+
+from .config import Config
+
+log = logging.getLogger("speakerd.bluez")
+
+BLUEZ = "org.bluez"
+OM_IFACE = "org.freedesktop.DBus.ObjectManager"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+DEVICE_IFACE = "org.bluez.Device1"
+TRANSPORT_IFACE = "org.bluez.MediaTransport1"
+PLAYER_IFACE = "org.bluez.MediaPlayer1"
+
+_DEV_PATH_RE = re.compile(r"/dev_((?:[0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2})")
+
+STREAMING_STATES = ("pending", "active")
+
+CONNECT_TIMEOUT_S = 30
+
+
+def _mac_from_path(path: str) -> str | None:
+    m = _DEV_PATH_RE.search(path)
+    return m.group(1).replace("_", ":").upper() if m else None
+
+
+class BluezEngine:
+    def __init__(self, cfg: Config, sink):
+        self._cfg = cfg
+        self._sink = sink
+        self._bus: MessageBus | None = None
+
+        # mac -> {path: connected} (a device can exist on several adapters)
+        self._dev_paths: dict[str, dict[str, bool]] = {}
+        self._connected: dict[str, bool] = {}          # mac -> published value
+        self._transports: dict[str, tuple[str, str]] = {}  # path -> (mac, state)
+        self._players: dict[str, dict] = {}            # path -> {mac,status,track,position,seq}
+        self._seq = 0
+
+        self._streaming_current = False
+        self._streaming_published = False
+        self._streaming_task: asyncio.Task | None = None
+        self._last_now_playing_key: tuple | None = None
+        self._rescan_lock = asyncio.Lock()
+        self._sig_buffer: list[Message] | None = None
+        self._tasks: set[asyncio.Task] = set()
+
+    def _spawn(self, coro) -> asyncio.Task:
+        # keep a strong reference: the loop only holds weak refs to tasks
+        task = asyncio.get_running_loop().create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    # ------------------------------------------------------------- lifecycle
+
+    async def start(self) -> None:
+        self._bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        self._bus.add_message_handler(self._handle_signal)
+        for rule in (
+            f"type='signal',sender='{BLUEZ}',interface='{PROPS_IFACE}',member='PropertiesChanged'",
+            f"type='signal',sender='{BLUEZ}',interface='{OM_IFACE}'",
+            "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+            f"member='NameOwnerChanged',arg0='{BLUEZ}'",
+        ):
+            await self._call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                             "org.freedesktop.DBus", "AddMatch", "s", [rule])
+        await self.rescan()
+
+    async def wait_for_disconnect(self) -> None:
+        await self._bus.wait_for_disconnect()
+
+    async def rescan(self) -> None:
+        """Full state rebuild from GetManagedObjects; retries while bluetoothd is down."""
+        async with self._rescan_lock:
+            await self._rescan_locked()
+
+    async def _rescan_locked(self) -> None:
+        # Signals can arrive in the same socket drain as the GetManagedObjects
+        # reply and would be wiped by the clear+ingest below — buffer them
+        # while the snapshot is in flight and replay them on top of it.
+        self._sig_buffer = []
+        try:
+            objects = None
+            while objects is None:
+                try:
+                    reply = await self._call(BLUEZ, "/", OM_IFACE, "GetManagedObjects")
+                    objects = reply.body[0]
+                except _DBusCallError as e:
+                    log.warning("GetManagedObjects failed (%s) — bluetoothd down? retrying in 3s", e)
+                    self._sig_buffer.clear()  # stale pre-snapshot signals
+                    await asyncio.sleep(3)
+
+            self._dev_paths.clear()
+            self._transports.clear()
+            self._players.clear()
+            for path, ifaces in objects.items():
+                self._ingest(path, ifaces)
+            buffered = self._sig_buffer
+        finally:
+            self._sig_buffer = None
+        for msg in buffered:
+            self._process_signal(msg)
+        log.info("rescan: %d device paths, %d transports, %d players",
+                 sum(len(v) for v in self._dev_paths.values()),
+                 len(self._transports), len(self._players))
+        self._publish_all(force=True)
+
+    # ------------------------------------------------------------- ingestion
+
+    def _ingest(self, path: str, ifaces: dict) -> None:
+        dev = ifaces.get(DEVICE_IFACE)
+        if dev is not None and "Address" in dev:
+            mac = str(dev["Address"].value).upper()
+            if mac in self._cfg.by_mac:
+                connected = bool(dev["Connected"].value) if "Connected" in dev else False
+                self._dev_paths.setdefault(mac, {})[path] = connected
+
+        if TRANSPORT_IFACE in ifaces:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac:
+                state = str(ifaces[TRANSPORT_IFACE].get("State").value) \
+                    if ifaces[TRANSPORT_IFACE].get("State") else "idle"
+                self._transports[path] = (mac, state)
+
+        if PLAYER_IFACE in ifaces:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac:
+                props = ifaces[PLAYER_IFACE]
+                self._seq += 1
+                self._players[path] = {
+                    "mac": mac,
+                    "status": str(props["Status"].value) if "Status" in props else "stopped",
+                    "track": self._unwrap_track(props["Track"].value) if "Track" in props else {},
+                    "position": int(props["Position"].value) if "Position" in props else None,
+                    "seq": self._seq,
+                }
+
+    @staticmethod
+    def _unwrap_track(track_variant_dict) -> dict:
+        out = {}
+        for k, v in track_variant_dict.items():
+            out[k] = v.value if hasattr(v, "value") else v
+        return out
+
+    # ------------------------------------------------------------- signals
+
+    def _handle_signal(self, msg: Message):
+        # dbus-next dispatches this on the asyncio loop thread — safe to mutate state.
+        if msg.message_type != MessageType.SIGNAL:
+            return None
+        if msg.member == "NameOwnerChanged":
+            _name, _old, new = msg.body
+            self._spawn(self._on_bluez_owner_changed(new))
+            return None
+        if self._sig_buffer is not None:
+            self._sig_buffer.append(msg)
+            return None
+        self._process_signal(msg)
+        return None
+
+    def _process_signal(self, msg: Message) -> None:
+        try:
+            if msg.interface == PROPS_IFACE and msg.member == "PropertiesChanged":
+                iface, changed, _invalidated = msg.body
+                self._on_props_changed(msg.path, iface, changed)
+            elif msg.interface == OM_IFACE and msg.member == "InterfacesAdded":
+                path, ifaces = msg.body
+                self._on_interfaces_added(path, ifaces)
+            elif msg.interface == OM_IFACE and msg.member == "InterfacesRemoved":
+                path, ifaces = msg.body
+                self._on_interfaces_removed(path, ifaces)
+        except Exception:
+            log.exception("error handling D-Bus signal %s.%s at %s",
+                          msg.interface, msg.member, msg.path)
+
+    def _on_props_changed(self, path: str, iface: str, changed: dict) -> None:
+        if iface == DEVICE_IFACE and "Connected" in changed:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac:
+                self._dev_paths.setdefault(mac, {})[path] = bool(changed["Connected"].value)
+                self._publish_device(mac)
+
+        elif iface == TRANSPORT_IFACE and "State" in changed:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac:
+                self._transports[path] = (mac, str(changed["State"].value))
+                self._recompute_streaming()
+
+        elif iface == PLAYER_IFACE:
+            mac = _mac_from_path(path)
+            if mac not in self._cfg.by_mac:
+                return
+            player = self._players.get(path)
+            if player is None:
+                self._seq += 1
+                player = {"mac": mac, "status": "stopped", "track": {},
+                          "position": None, "seq": self._seq}
+                self._players[path] = player
+            material = False
+            if "Status" in changed:
+                player["status"] = str(changed["Status"].value)
+                material = True
+            if "Track" in changed:
+                player["track"] = self._unwrap_track(changed["Track"].value)
+                material = True
+            if "Position" in changed:
+                player["position"] = int(changed["Position"].value)
+            if material:
+                self._seq += 1
+                player["seq"] = self._seq
+                self._publish_now_playing()
+
+    def _on_interfaces_added(self, path: str, ifaces: dict) -> None:
+        self._ingest(path, ifaces)
+        if DEVICE_IFACE in ifaces:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac:
+                self._publish_device(mac)
+        if TRANSPORT_IFACE in ifaces:
+            self._recompute_streaming()
+        if PLAYER_IFACE in ifaces:
+            self._publish_now_playing()
+
+    def _on_interfaces_removed(self, path: str, ifaces: list) -> None:
+        if DEVICE_IFACE in ifaces:
+            mac = _mac_from_path(path)
+            if mac in self._cfg.by_mac and mac in self._dev_paths:
+                self._dev_paths[mac].pop(path, None)
+                self._publish_device(mac)
+        if TRANSPORT_IFACE in ifaces and path in self._transports:
+            del self._transports[path]
+            self._recompute_streaming()
+        if PLAYER_IFACE in ifaces and path in self._players:
+            del self._players[path]
+            self._publish_now_playing()
+
+    async def _on_bluez_owner_changed(self, new_owner: str) -> None:
+        if new_owner:
+            log.warning("bluetoothd (re)started — rescanning in 1s")
+            await asyncio.sleep(1)
+            await self.rescan()
+        else:
+            log.warning("bluetoothd went away — clearing state")
+            self._dev_paths.clear()
+            self._transports.clear()
+            self._players.clear()
+            self._publish_all(force=False)
+
+    # ------------------------------------------------------------- publishing
+
+    def _publish_all(self, force: bool) -> None:
+        for dev in self._cfg.all_devices:
+            self._publish_device(dev.mac, force=force)
+        self._recompute_streaming()
+        if force:
+            # seed the retained topic even when the value never changed (startup)
+            self._sink.streaming_changed(self._streaming_published)
+        self._publish_now_playing(force=force)
+
+    def _publish_device(self, mac: str, force: bool = False) -> None:
+        connected = any(self._dev_paths.get(mac, {}).values())
+        if force or self._connected.get(mac) != connected:
+            self._connected[mac] = connected
+            self._sink.device_changed(self._cfg.by_mac[mac].slug, connected)
+
+    def _recompute_streaming(self) -> None:
+        val = any(mac in self._cfg.ios_macs and state in STREAMING_STATES
+                  for mac, state in self._transports.values())
+        self._streaming_current = val
+        if self._streaming_task is not None:
+            self._streaming_task.cancel()
+            self._streaming_task = None
+        if val == self._streaming_published:
+            return
+        if val:
+            # rising edge: publish immediately
+            self._streaming_published = True
+            self._sink.streaming_changed(True)
+        else:
+            # falling edge: debounce track-change flaps
+            self._streaming_task = self._spawn(self._publish_streaming_off_later())
+
+    async def _publish_streaming_off_later(self) -> None:
+        try:
+            await asyncio.sleep(self._cfg.streaming_debounce_s)
+        except asyncio.CancelledError:
+            return
+        if not self._streaming_current and self._streaming_published:
+            self._streaming_published = False
+            self._sink.streaming_changed(False)
+
+    def _current_player(self) -> dict | None:
+        if not self._players:
+            return None
+        playing = [p for p in self._players.values() if p["status"] == "playing"]
+        pool = playing or list(self._players.values())
+        return max(pool, key=lambda p: p["seq"])
+
+    def _publish_now_playing(self, force: bool = False) -> None:
+        p = self._current_player()
+        if p is None:
+            payload = {"status": "idle", "title": None, "artist": None,
+                       "album": None, "duration": None, "position": None,
+                       "device": None}
+            key = ("idle",)
+        else:
+            track = p["track"]
+            payload = {
+                "status": p["status"],
+                "title": track.get("Title"),
+                "artist": track.get("Artist"),
+                "album": track.get("Album"),
+                "duration": track.get("Duration"),
+                "position": p["position"],
+                "device": self._cfg.by_mac[p["mac"]].name,
+            }
+            key = (p["status"], payload["title"], payload["artist"],
+                   payload["album"], payload["device"])
+        if force or key != self._last_now_playing_key:
+            self._last_now_playing_key = key
+            self._sink.now_playing_changed(payload)
+
+    # ------------------------------------------------------------- commands
+
+    async def connect_device(self, slug: str) -> tuple[bool, str | None]:
+        return await self._device_call(slug, "Connect")
+
+    async def disconnect_device(self, slug: str) -> tuple[bool, str | None]:
+        return await self._device_call(slug, "Disconnect")
+
+    async def fix_metadata(self) -> tuple[bool, str | None]:
+        """Kohler recipe: disconnect amp, wait, connect amp (phone must stay connected)."""
+        ok, err = await self._device_call("amp", "Disconnect")
+        if not ok:
+            log.warning("fix_metadata: amp disconnect failed (%s), connecting anyway", err)
+        await asyncio.sleep(self._cfg.fix_metadata_delay_s)
+        return await self._device_call("amp", "Connect")
+
+    async def transport_command(self, cmd: str) -> tuple[bool, str | None]:
+        player = self._current_player()
+        if player is None:
+            return False, "no active Bluetooth player"
+        path = next(p for p, v in self._players.items() if v is player)
+        if cmd == "playpause":
+            cmd = "pause" if player["status"] == "playing" else "play"
+        member = {"play": "Play", "pause": "Pause", "stop": "Stop",
+                  "next": "Next", "previous": "Previous"}.get(cmd)
+        if member is None:
+            return False, f"unknown transport command {cmd!r}"
+        try:
+            await self._call(BLUEZ, path, PLAYER_IFACE, member, timeout=10)
+            return True, None
+        except _DBusCallError as e:
+            return False, str(e)
+
+    async def _device_call(self, slug: str, member: str) -> tuple[bool, str | None]:
+        dev = self._cfg.by_slug.get(slug)
+        if dev is None:
+            return False, f"unknown device {slug!r}"
+        paths = sorted(self._dev_paths.get(dev.mac, {}))
+        path = paths[0] if paths else f"/org/bluez/{self._cfg.adapter}/dev_{dev.dbus_mac}"
+        log.info("%s %s (%s)", member, dev.name, path)
+        try:
+            await self._call(BLUEZ, path, DEVICE_IFACE, member, timeout=CONNECT_TIMEOUT_S)
+            return True, None
+        except _DBusCallError as e:
+            log.warning("%s %s failed: %s", member, dev.name, e)
+            return False, str(e)
+
+    # ------------------------------------------------------------- low level
+
+    async def _call(self, destination: str, path: str, interface: str, member: str,
+                    signature: str = "", body: list | None = None,
+                    timeout: float = 15) -> Message:
+        if self._bus is None:
+            raise _DBusCallError(f"{member}: not connected to D-Bus yet")
+        try:
+            reply = await asyncio.wait_for(
+                self._bus.call(Message(destination=destination, path=path,
+                                       interface=interface, member=member,
+                                       signature=signature, body=body or [])),
+                timeout)
+        except asyncio.TimeoutError:
+            raise _DBusCallError(f"{member}: timed out after {timeout}s") from None
+        except OSError as e:
+            raise _DBusCallError(f"{member}: {e}") from None
+        if reply is None:
+            raise _DBusCallError(f"{member}: no reply")
+        if reply.message_type == MessageType.ERROR:
+            detail = reply.body[0] if reply.body else ""
+            raise _DBusCallError(f"{reply.error_name}: {detail}")
+        return reply
+
+
+class _DBusCallError(Exception):
+    pass

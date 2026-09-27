@@ -1,0 +1,38 @@
+# Test fixture: a fully featured node. Not a real device; all MACs are fake.
+[mqtt]
+host = "broker.invalid"
+port = 1883
+username = "test"
+password = "test"
+client_id = "nowairplaying"
+base_topic = "nowairplaying"
+discovery_prefix = "homeassistant"
+announce_prefix = "speakerd/nodes"
+
+[bluetooth]
+adapter = "hci0"
+amp_mac = "00:00:00:00:00:AA"
+amp_name = "Kohler Amplifier"
+fix_metadata_delay_s = 3
+streaming_debounce_s = 2
+amp_metadata_export = true
+amp_reconnect_debounce_s = 5
+amp_reconnect_retry_delay_s = 10
+amp_reconnect_tries = 3
+
+[airplay]
+enabled = true
+
+[system]
+power_commands = true
+state_file = "~/.local/state/speakerd/state.json"
+
+[[devices]]
+name = "Test iPhone"
+slug = "test_iphone"
+mac = "00:00:00:00:00:01"
+
+[[devices]]
+name = "Test iPad"
+slug = "test_ipad"
+mac = "00:00:00:00:00:02"

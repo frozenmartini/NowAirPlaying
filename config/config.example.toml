@@ -1,0 +1,62 @@
+# speakerd configuration. Copy to ~/.config/speakerd/config.toml and chmod 600.
+# The real file holds the MQTT password: never commit it.
+
+# [node]: identity of this node. Optional; everything defaults from
+# mqtt.base_topic. Give each node on the same broker its own id, base_topic
+# and client_id.
+#[node]
+#id   = "kitchen_speaker"    # [a-z0-9_]; default: mqtt.base_topic. Changing it
+#                            # re-keys every HA entity (new unique_ids); the old
+#                            # retained discovery + announce topics must be
+#                            # cleared by hand with empty retained publishes.
+#name = "Kitchen Speaker"    # default: id, underscores -> spaces, title-cased
+#area = "Kitchen"            # optional; only honoured when HA first creates the device
+
+[mqtt]
+host = "homeassistant.local"
+port = 1883
+username = "CHANGE-ME"
+password = "CHANGE-ME"
+client_id = "nowairplaying"
+base_topic = "nowairplaying"
+discovery_prefix = "homeassistant"
+announce_prefix = "speakerd/nodes"   # retained node announcement: <prefix>/<node id>
+
+[bluetooth]
+adapter = "hci0"
+amp_mac = "00:00:00:00:00:00"  # your Kohler amplifier's Bluetooth address
+amp_name = "Kohler Amplifier"
+fix_metadata_delay_s = 3     # disconnect amp -> sleep -> connect amp
+streaming_debounce_s = 2     # falling-edge filter for transport-state flaps
+# Export now-playing metadata to the amp's screen via BlueZ Media1: one
+# permanent AVRCP player, properties-only updates, the only transition shape
+# a pre-AVRCP-1.4 controller survives. Do not run mpris-proxy alongside it.
+amp_metadata_export = true
+# Raw forensic log of the export (feeds, emits, amp button presses,
+# registration events). For debugging only; omit to disable.
+#amp_export_raw_log = "~/.local/state/speakerd/amp_export-raw.log"
+
+# Amp auto-reconnect: when the amp's link drops unexpectedly (or is down
+# after boot), speakerd reconnects it. Gated by the discovered HA switch
+# "Auto Reconnect <amp_name>" (persisted in state_file below). The final
+# failure lands on <base_topic>/device/amp/result.
+amp_reconnect_debounce_s = 5     # wait after a drop before acting
+amp_reconnect_retry_delay_s = 10 # pause between failed attempts
+amp_reconnect_tries = 3          # attempts per outage before giving up
+
+[airplay]
+enabled = true               # shairport-sync publishes to <base_topic>/airplay
+
+[system]
+# true = subscribe to <base_topic>/system/{reboot,shutdown} (payload PRESS,
+# result JSON on system/result) and run `sudo -n systemctl reboot|poweroff`.
+# Requires passwordless sudo for systemctl.
+power_commands = false
+state_file = "~/.local/state/speakerd/state.json"  # persists the auto-reconnect gate
+
+# Phones that stream to the node over Bluetooth (optional add-on; AirPlay
+# needs no pairing). One block per phone.
+[[devices]]
+name = "My iPhone"
+slug = "my_iphone"
+mac = "00:00:00:00:00:01"

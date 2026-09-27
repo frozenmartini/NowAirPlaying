@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# local-only material
+CLAUDE.md
+.claude/
+*.code-workspace
+
+# build output
+build/out/
+*.deb
+*.img
+*.img.xz
