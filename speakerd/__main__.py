@@ -1,4 +1,4 @@
-"""speakerd entry point: wires BlueZ engine + MQTT link + HA discovery."""
+"""speakerd entry point: wires BlueZ engine + shairport D-Bus link + MQTT link + HA discovery."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,8 @@ from .amp_export import AmpMetadataExport
 from .bluez import BluezEngine
 from .config import AMP_SLUG, Config
 from .discovery import build_announce, build_discovery
-from .mqtt_link import EV_CONNECTED, EV_MESSAGE, MqttLink
+from .mqtt_link import EV_CONNECTED, EV_MESSAGE, MqttLink, NullMqttLink
+from .shairport import ShairportLink
 
 log = logging.getLogger("speakerd")
 
@@ -65,6 +66,10 @@ class App:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.engine = BluezEngine(cfg, sink=self)
         self.airplay = AirplayState()
+        # AirPlay state and commands travel over shairport's own D-Bus
+        # interface, never MQTT: the amp screen must not depend on a broker
+        self.shairport = (ShairportLink(self._airplay_changed)
+                          if cfg.airplay_enabled else None)
         self._bt_now_playing: dict = {"status": "idle"}
         self.amp_export = (
             AmpMetadataExport(cfg, on_command=self._amp_export_command,
@@ -85,7 +90,9 @@ class App:
 
         subscriptions = [
             (cfg.topic("device", "+", "set"), 1),
-            (cfg.topic("bt", "transport", "set"), 1),
+            # QoS 0, like the power buttons below: a transport press queued
+            # while the daemon is down would replay as a stale skip/pause
+            (cfg.topic("bt", "transport", "set"), 0),
             (cfg.topic("amp", "fix_metadata"), 1),
             (cfg.topic("amp", "auto_reconnect", "set"), 1),
             (f"{cfg.discovery_prefix}/status", 1),
@@ -100,8 +107,11 @@ class App:
             subscriptions += [(cfg.topic("system", "reboot"), 0),
                               (cfg.topic("system", "shutdown"), 0)]
         if cfg.airplay_enabled:
-            subscriptions.append((cfg.topic("airplay", "#"), 1))
-        self.mqtt = MqttLink(cfg, loop, self.queue, subscriptions)
+            # HA's AirPlay buttons; speakerd relays them to shairport over D-Bus.
+            # QoS 0 for the same reason as bt/transport/set
+            subscriptions.append((cfg.topic("airplay", "remote"), 0))
+        link = MqttLink if cfg.mqtt_enabled else NullMqttLink
+        self.mqtt = link(cfg, loop, self.queue, subscriptions)
 
     def _spawn(self, coro) -> asyncio.Task:
         # keep a strong reference: the loop only holds weak refs to tasks
@@ -160,6 +170,11 @@ class App:
         source = "both" if (bt and ap) else "bluetooth" if bt else "airplay" if ap else "idle"
         self._publish_retained(self.cfg.topic("source"), source)
 
+    def _airplay_changed(self, snapshot: dict) -> None:
+        """ShairportLink callback: a shairport-sync property changed."""
+        if self.airplay.apply(snapshot):
+            self._publish_airplay()
+
     def _publish_airplay(self) -> None:
         self._publish_retained(self.cfg.topic("airplay", "now_playing"),
                                json.dumps(self.airplay.now_playing()))
@@ -206,12 +221,8 @@ class App:
     def _amp_export_command(self, cmd: str) -> None:
         """Amp button press, routed to whichever source owns the screen."""
         if self._amp_export_source() == "airplay":
-            verb = {"play": "play", "pause": "pause", "playpause": "playpause",
-                    "stop": "stop", "next": "nextitem",
-                    "previous": "previtem"}.get(cmd)
-            if verb is not None:
-                self.mqtt.publish(self.cfg.topic("airplay", "remote"), verb,
-                                  retain=False)
+            if self.shairport is not None:
+                self.shairport.command(cmd)
         else:
             self._spawn(self._transport_command(cmd))
 
@@ -426,9 +437,13 @@ class App:
         elif parts == ["bt", "transport", "set"]:
             self._spawn(self._transport_command(text.lower()))
 
-        elif parts[0] == "airplay" and len(parts) >= 2:
-            if self.airplay.handle("/".join(parts[1:]), payload, retained):
-                self._publish_airplay()
+        elif parts == ["airplay", "remote"]:
+            if retained:
+                log.warning("ignoring retained command on %s", topic)
+            elif self.shairport is None:
+                log.warning("AirPlay command received but [airplay] is disabled")
+            else:
+                self.shairport.command(text.lower())
 
     # ---------------------------------------------------------- main loop
 
@@ -439,8 +454,9 @@ class App:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
 
-        if self.cfg.airplay_enabled:
+        if self.shairport is not None:
             self._publish_airplay()  # seed retained topics before first AirPlay event
+            await self.shairport.start()
         # seed the gate state so the HA switch is never unknown
         self._publish_retained(self.cfg.topic("amp", "auto_reconnect"),
                                "ON" if self._auto_reconnect else "OFF")
@@ -487,6 +503,8 @@ class App:
         log.info("shutting down")
         if self.amp_export is not None:
             await self.amp_export.stop()
+        if self.shairport is not None:
+            await self.shairport.stop()
         for task in (engine_runner, consumer):
             task.cancel()
         self.mqtt.stop()

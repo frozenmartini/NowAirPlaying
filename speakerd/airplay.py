@@ -1,10 +1,10 @@
-"""AirPlay state aggregation from shairport-sync's MQTT topics.
+"""AirPlay state aggregation from shairport-sync's D-Bus snapshot.
 
-shairport-sync (publish_parsed) publishes one value per subtopic under
-<base>/airplay/: title, artist, album, client_name, active, playing, and
-event topics play_start/play_end/play_resume/play_flush/active_start/
-active_end. This module folds them into one now_playing dict; the app
-publishes it retained and recomputes the active-source sensor.
+ShairportLink (shairport.py) hands over one snapshot per change: whether
+shairport-sync is on the bus, its Active flag, the RemoteControl PlayerState
+("Playing" / "Paused" / "Stopped" / "Not Available"), ClientName and the
+MPRIS-style Metadata dict. This module folds that into one now_playing dict;
+the app publishes it and recomputes the active-source sensor.
 """
 from __future__ import annotations
 
@@ -12,14 +12,13 @@ import logging
 
 log = logging.getLogger("speakerd.airplay")
 
-_TRUTHY = {"1", "true", "yes", "on"}
 
-# subtopics we fold in; everything else (cover art, format, volume, …) is ignored
-_TEXT_FIELDS = {"title", "artist", "album", "client_name"}
-_IGNORED = {"now_playing", "remote"}  # our own output / command channel
-# edge-triggered event topics: meaningful live, stale when replayed as retained
-_EVENTS = {"active_start", "active_end", "play_start", "play_end",
-           "play_resume", "play_flush"}
+def _text(v) -> str | None:
+    if isinstance(v, (list, tuple)):  # xesam:artist is a string list
+        v = ", ".join(str(x) for x in v if x)
+    if v is None:
+        return None
+    return str(v).strip() or None
 
 
 class AirplayState:
@@ -39,45 +38,25 @@ class AirplayState:
             return "paused"
         return "idle"
 
-    def handle(self, subtopic: str, payload: bytes, retained: bool = False) -> bool:
-        """Returns True when the folded state materially changed."""
-        if subtopic in _IGNORED:
-            return False
-        if retained and subtopic in _EVENTS:
-            # retained replay rehydrates only level state (active/playing/title/…)
-            return False
+    def apply(self, snap: dict) -> bool:
+        """Fold a ShairportLink snapshot. Returns True when the folded state
+        materially changed."""
         before = self._key()
-        text = payload.decode("utf-8", errors="replace").strip()
-        if text == "--":  # shairport's empty_payload_substitute
-            text = ""
-
-        if subtopic in _TEXT_FIELDS:
-            value = text or None
-            if subtopic == "client_name":
-                self.client = value
-            else:
-                setattr(self, subtopic, value)
-        elif subtopic == "active":
-            self.active = text.lower() in _TRUTHY
-            if not self.active:
-                self._clear_track()
-        elif subtopic == "playing":
-            self.playing = text.lower() in _TRUTHY
-        elif subtopic == "active_start":
-            self.active = True
-        elif subtopic == "active_end":
-            self.active = False
-            self.playing = False
-            self._clear_track()
-        elif subtopic in ("play_start", "play_resume"):
-            self.active = True
-            self.playing = True
-        elif subtopic == "play_end":
-            self.playing = False
-        # play_flush fires on seeks/track changes; shairport keeps 'playing' — so do we
+        present = bool(snap.get("present"))
+        self.playing = present and snap.get("player_state") == "Playing"
+        # a playing session is active even if the Active edge hasn't landed yet
+        self.active = present and (bool(snap.get("active")) or self.playing)
+        if self.active:
+            md = snap.get("metadata") or {}
+            self.title = _text(md.get("xesam:title"))
+            self.artist = _text(md.get("xesam:artist"))
+            self.album = _text(md.get("xesam:album"))
+            self.client = _text(snap.get("client_name"))
         else:
-            return False
-
+            # shairport keeps the last track's metadata after a session ends;
+            # an idle node must not keep showing it
+            self._clear_track()
+            self.client = None
         return self._key() != before
 
     def _clear_track(self) -> None:

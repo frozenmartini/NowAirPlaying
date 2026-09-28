@@ -1,4 +1,4 @@
-"""paho-mqtt 1.6 (v1 callback API) <-> asyncio bridge.
+"""paho-mqtt 1.6 / 2.x (v1 callback API) <-> asyncio bridge.
 
 paho runs its network loop in its own thread; every callback here fires on
 that thread and must only hand data to asyncio via loop.call_soon_threadsafe.
@@ -32,8 +32,11 @@ class MqttLink:
         # clean_session=False + stable client_id: the broker keeps our
         # subscriptions and queues QoS-1 commands sent while we are
         # reconnecting. Topics that must NOT be queued for the offline
-        # session (system power commands) subscribe at QoS 0.
-        c = mqtt.Client(client_id=cfg.client_id, clean_session=False)
+        # session (power and transport buttons) subscribe at QoS 0.
+        # paho 2.x (trixie) refuses a Client without a callback API version;
+        # ask for v1 so the callbacks below keep their 1.6 signatures
+        api = (mqtt.CallbackAPIVersion.VERSION1,) if hasattr(mqtt, "CallbackAPIVersion") else ()
+        c = mqtt.Client(*api, client_id=cfg.client_id, clean_session=False)
         c.username_pw_set(cfg.username, cfg.password)
         c.will_set(cfg.availability_topic, "offline", qos=1, retain=True)
         c.reconnect_delay_set(min_delay=1, max_delay=30)
@@ -86,3 +89,26 @@ class MqttLink:
         self._loop.call_soon_threadsafe(
             self._queue.put_nowait,
             (EV_MESSAGE, msg.topic, (msg.payload, bool(msg.retain))))
+
+
+class _NoPublish:
+    def wait_for_publish(self, timeout=None) -> None:
+        pass
+
+
+class NullMqttLink:
+    """Stand-in when [mqtt] is off: the node runs standalone, every publish
+    goes nowhere and no command ever arrives. Keeps App free of MQTT checks."""
+
+    def __init__(self, *args, **kwargs):
+        self._subscriptions: list[tuple[str, int]] = []
+
+    def start(self) -> None:
+        log.info("MQTT disabled in config — running standalone")
+
+    def stop(self) -> None:
+        pass
+
+    def publish(self, topic: str, payload: str, retain: bool = False,
+                qos: int = 1) -> _NoPublish:
+        return _NoPublish()

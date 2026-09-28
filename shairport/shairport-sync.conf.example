@@ -1,6 +1,11 @@
-// shairport-sync v5 config. Copy to ~/.config/shairport-sync.conf and chmod 600
-// (it holds the MQTT password). The user unit runs it with
-//   /usr/local/bin/shairport-sync -c %h/.config/shairport-sync.conf
+// shairport-sync v5 config. Copy to ~/.config/shairport-sync.conf.
+// The user unit runs it with
+//   /usr/bin/shairport-sync -c %h/.config/shairport-sync.conf
+//
+// shairport-sync talks ONLY to speakerd, over its native D-Bus interface on
+// the user's session bus. It has no MQTT client and no MPRIS interface: both
+// are left out of the build (see docs/ROADMAP.md, package builds). speakerd
+// is the node's only MQTT client, when MQTT is used at all.
 //
 // When upgrading shairport-sync, start from its own sample config: v5 renamed
 // settings compared with v4.
@@ -14,27 +19,13 @@ general =
                                  // unit races the system nqptp unit). Explicit airplay2 makes
                                  // shairport exit instead, and Restart=on-failure retries it
                                  // once nqptp is up.
+  dbus_service_bus = "session";  // org.gnome.ShairportSync on the user's session bus, where
+                                 // speakerd (also a user unit) finds it. On the default,
+                                 // "system", the bus refuses the name to a non-root user and
+                                 // shairport only logs a warning.
 };
 
 metadata =
 {
-  enabled = "yes";
+  enabled = "yes";               // feeds the D-Bus Metadata property speakerd reads
 };
-
-mqtt =
-{
-  enabled = "yes";
-  hostname = "homeassistant.local";
-  port = 1883;
-  username = "CHANGE-ME";
-  password = "CHANGE-ME";
-  topic = "nowairplaying/airplay";  // <mqtt.base_topic>/airplay from speakerd's config
-  publish_parsed = "yes";        // per-key subtopics: title, artist, active, playing, ...
-  publish_retain = "yes";        // lets speakerd rehydrate AirPlay state after a restart
-  enable_remote = "yes";         // accepts playpause/nextitem/previtem on .../airplay/remote
-  // enable_autodiscovery stays OFF: speakerd owns HA discovery (one device)
-};
-
-// Do NOT enable shairport's MPRIS interface. speakerd already exports the
-// metadata to the amp through one permanent player; a second MPRIS player on
-// the bus is exactly the failure that design removes.

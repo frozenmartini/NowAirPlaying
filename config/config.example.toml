@@ -1,5 +1,9 @@
 # speakerd configuration. Copy to ~/.config/speakerd/config.toml and chmod 600.
-# The real file holds the MQTT password: never commit it.
+# With MQTT on, the real file holds the MQTT password: never commit it.
+#
+# The only required section is [bluetooth]. Without [mqtt] the node runs
+# standalone: AirPlay plays and the amp's screen shows what's playing, with
+# no broker and no Home Assistant.
 
 # [node]: identity of this node. Optional; everything defaults from
 # mqtt.base_topic. Give each node on the same broker its own id, base_topic
@@ -12,15 +16,18 @@
 #name = "Kitchen Speaker"    # default: id, underscores -> spaces, title-cased
 #area = "Kitchen"            # optional; only honoured when HA first creates the device
 
-[mqtt]
-host = "homeassistant.local"
-port = 1883
-username = "CHANGE-ME"
-password = "CHANGE-ME"
-client_id = "nowairplaying"
-base_topic = "nowairplaying"
-discovery_prefix = "homeassistant"
-announce_prefix = "speakerd/nodes"   # retained node announcement: <prefix>/<node id>
+# [mqtt]: optional, for Home Assistant. speakerd is the node's only MQTT
+# client; shairport-sync never talks to the broker.
+#[mqtt]
+#enabled = true               # false keeps the section but runs standalone
+#host = "homeassistant.local"
+#port = 1883
+#username = "CHANGE-ME"
+#password = "CHANGE-ME"
+#client_id = "nowairplaying"
+#base_topic = "nowairplaying"
+#discovery_prefix = "homeassistant"
+#announce_prefix = "speakerd/nodes"   # retained node announcement: <prefix>/<node id>
 
 [bluetooth]
 adapter = "hci0"
@@ -45,7 +52,8 @@ amp_reconnect_retry_delay_s = 10 # pause between failed attempts
 amp_reconnect_tries = 3          # attempts per outage before giving up
 
 [airplay]
-enabled = true               # shairport-sync publishes to <base_topic>/airplay
+enabled = true               # follow shairport-sync over D-Bus (org.gnome.ShairportSync
+                             # on the session bus): metadata to the amp, amp buttons back
 
 [system]
 # true = subscribe to <base_topic>/system/{reboot,shutdown} (payload PRESS,
@@ -54,9 +62,9 @@ enabled = true               # shairport-sync publishes to <base_topic>/airplay
 power_commands = false
 state_file = "~/.local/state/speakerd/state.json"  # persists the auto-reconnect gate
 
-# Phones that stream to the node over Bluetooth (optional add-on; AirPlay
-# needs no pairing). One block per phone.
-[[devices]]
-name = "My iPhone"
-slug = "my_iphone"
-mac = "00:00:00:00:00:01"
+# Phones that stream to the node over Bluetooth: an optional add-on (AirPlay
+# needs no pairing). One block per phone; none is fine.
+#[[devices]]
+#name = "My iPhone"
+#slug = "my_iphone"
+#mac = "00:00:00:00:00:01"

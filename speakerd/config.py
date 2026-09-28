@@ -1,6 +1,8 @@
 """Configuration loading: TOML -> frozen dataclasses.
 
-Single source of truth for MQTT credentials and the device registry.
+Single source of truth for MQTT credentials and the device registry. MQTT is
+optional: without an [mqtt] section (or with enabled = false) the node runs
+standalone and only Home Assistant loses its view.
 MACs are canonicalized to uppercase colon form; the D-Bus underscore
 form is always derived, never stored (the old scripts' mixed formats
 were a live bug).
@@ -50,11 +52,12 @@ class Config:
     node_id: str
     node_name: str
     node_area: str | None
-    # [mqtt]
-    host: str
+    # [mqtt] — optional; mqtt_enabled False = standalone, the rest unused
+    mqtt_enabled: bool
+    host: str | None
     port: int
-    username: str
-    password: str
+    username: str | None
+    password: str | None
     client_id: str
     base_topic: str
     discovery_prefix: str
@@ -126,10 +129,18 @@ def load(path: str) -> Config:
         raw = tomllib.load(f)
 
     try:
-        m = raw["mqtt"]
         b = raw["bluetooth"]
     except KeyError as e:
         raise ConfigError(f"missing required section {e}") from None
+    m = raw.get("mqtt", {})
+    # standalone = no [mqtt] section, or enabled = false. A present section
+    # with its keys missing is an edit mistake and must fail loudly.
+    mqtt_enabled = "mqtt" in raw and bool(m.get("enabled", True))
+    if mqtt_enabled:
+        missing = [k for k in ("host", "username", "password") if k not in m]
+        if missing:
+            raise ConfigError(f"[mqtt] is missing {', '.join(missing)} "
+                              "(or set enabled = false)")
 
     devices = []
     seen_slugs, seen_macs = set(), set()
@@ -152,8 +163,6 @@ def load(path: str) -> Config:
         seen_slugs.add(dev.slug)
         seen_macs.add(dev.mac)
         devices.append(dev)
-    if not devices:
-        raise ConfigError("no [[devices]] configured")
 
     amp = Device(
         name=str(b.get("amp_name", "Kohler Amplifier")),
@@ -190,10 +199,11 @@ def load(path: str) -> Config:
         node_id=node_id,
         node_name=str(n.get("name", node_id.replace("_", " ").title())),
         node_area=str(area) if area else None,
-        host=str(m["host"]),
+        mqtt_enabled=mqtt_enabled,
+        host=str(m["host"]) if mqtt_enabled else None,
         port=int(m.get("port", 1883)),
-        username=str(m["username"]),
-        password=str(m["password"]),
+        username=str(m["username"]) if mqtt_enabled else None,
+        password=str(m["password"]) if mqtt_enabled else None,
         client_id=str(m.get("client_id", "speakerd")),
         base_topic=base_topic,
         discovery_prefix=str(m.get("discovery_prefix", "homeassistant")).rstrip("/"),

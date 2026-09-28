@@ -16,6 +16,19 @@ class FakeMqtt:
     def publish(self, topic, payload, retain=False, qos=1):
         self.published.append((topic, payload, retain)); return FakeInfo()
 
+class FakeShairport:
+    def __init__(self): self.sent = []
+    def command(self, verb): self.sent.append(verb); return True
+
+def ap_snapshot(state, active=True, present=True, title=None, artist=None,
+                album=None, client=None):
+    md = {}
+    if title is not None: md["xesam:title"] = title
+    if artist is not None: md["xesam:artist"] = artist
+    if album is not None: md["xesam:album"] = album
+    return {"present": present, "active": active, "player_state": state,
+            "client_name": client, "metadata": md}
+
 def make_app(tmp):
     cfg = config_mod.load(FIXTURE_CONFIG)
     object.__setattr__(cfg, "state_file", os.path.join(tmp, "state.json"))
@@ -102,12 +115,16 @@ async def test_retry_exhaustion(tmp):
 # ---- session-3 review-fix regression tests ----
 
 async def test_system_qos0(tmp):
-    """Queued-PRESS fix: system topics subscribe at QoS 0, everything else at 1."""
+    """Queued-PRESS fix: system and transport buttons subscribe at QoS 0,
+    everything else at 1."""
     app = make_app(tmp)
     subs = dict(app._orig_subs)
-    assert subs.get(app.cfg.topic("system", "reboot")) == 0, subs
-    assert subs.get(app.cfg.topic("system", "shutdown")) == 0, subs
-    assert all(q == 1 for t, q in subs.items() if not t.startswith(app.cfg.topic("system"))), subs
+    qos0 = {app.cfg.topic("system", "reboot"), app.cfg.topic("system", "shutdown"),
+            app.cfg.topic("bt", "transport", "set")}
+    if app.cfg.airplay_enabled:
+        qos0.add(app.cfg.topic("airplay", "remote"))
+    assert all(subs.get(t) == 0 for t in qos0), subs
+    assert all(q == 1 for t, q in subs.items() if t not in qos0), subs
     print("system_qos0: PASS")
 
 async def test_discovery_qos_and_cleanup(tmp):
@@ -118,6 +135,9 @@ async def test_discovery_qos_and_cleanup(tmp):
     assert reboot and json.loads(reboot[0])["qos"] == 0, reboot
     fixmeta = [p for t, p in cfgs.items() if "fix_metadata" in t]
     assert fixmeta and json.loads(fixmeta[0])["qos"] == 1, fixmeta
+    transport = [p for t, p in cfgs.items()
+                 if "/button/" in t and ("/bt_" in t or "/airplay_" in t)]
+    assert len(transport) == 6 and all(json.loads(p)["qos"] == 0 for p in transport), transport
     # power_commands off -> empty retained payloads clean up the old buttons
     object.__setattr__(app.cfg, "power_commands", False)
     cfgs = dict(build_discovery(app.cfg))
@@ -311,7 +331,8 @@ async def test_announce_payload(tmp):
     assert a["schema"] == ANNOUNCE_SCHEMA and a["node_id"] == "nowairplaying"
     assert a["device_id"] == cfg.device_id and a["base_topic"] == cfg.base_topic
     assert a["topics"]["availability"] == cfg.availability_topic
-    assert a["command_qos"] == {"default": 1, "system": 0}, a["command_qos"]
+    assert a["command_qos"] == {"default": 1, "system": 0, "bt/transport": 0,
+                                "airplay/remote": 0}, a["command_qos"]
     assert a["amp"]["slug"] == "amp"
     assert [d["slug"] for d in a["devices"]] == [d.slug for d in cfg.ios_devices]
     assert "amp" not in [d["slug"] for d in a["devices"]]
@@ -374,6 +395,7 @@ async def test_amp_export_arbitration(tmp):
                           "airplay": {"enabled": True}})
     app = App(cfg, asyncio.get_event_loop())
     app.mqtt = FakeMqtt()
+    app.shairport = FakeShairport()
     assert app.amp_export is not None
 
     app.now_playing_changed({"status": "playing", "title": "BT Song",
@@ -385,19 +407,17 @@ async def test_amp_export_arbitration(tmp):
 
     # BT pauses, AirPlay starts playing -> AirPlay owns the screen
     app._bt_now_playing["status"] = "paused"
-    app.airplay.handle("title", b"AP Song")
-    app.airplay.handle("play_start", b"")
-    app._publish_airplay()
+    app._airplay_changed(ap_snapshot("Playing", title="AP Song"))
     assert app.amp_export._last_key[0] == "airplay"
     assert app.amp_export._player.Metadata["xesam:title"].value == "AP Song"
 
-    # amp button under AirPlay ownership -> airplay/remote, shairport verbs
+    # amp button under AirPlay ownership -> shairport over D-Bus, never MQTT
     app._amp_export_command("next")
-    assert (cfg.topic("airplay", "remote"), "nextitem", False) in app.mqtt.published
+    assert app.shairport.sent == ["next"], app.shairport.sent
+    assert not any(t == cfg.topic("airplay", "remote") for t, _, _ in app.mqtt.published)
 
     # AirPlay ends -> the paused BT source takes the screen back
-    app.airplay.handle("active_end", b"")
-    app._publish_airplay()
+    app._airplay_changed(ap_snapshot("Stopped", active=False, title="AP Song"))
     assert app.amp_export._last_key[0] == "bluetooth"
     assert app.amp_export._player.PlaybackStatus == "Paused"
 
@@ -534,6 +554,94 @@ async def test_amp_export_reconnect_hygiene(tmp):
     print("amp_export_reconnect_hygiene: PASS")
 
 
+# ------------------------------------------------- AirPlay over D-Bus
+
+async def test_airplay_state_mapping(tmp):
+    from speakerd.airplay import AirplayState
+    a = AirplayState()
+    assert a.apply(ap_snapshot("Playing", title="T", artist=["A", "B"], album="Al",
+                               client="iPhone")) is True
+    assert a.now_playing() == {"status": "playing", "title": "T", "artist": "A, B",
+                               "album": "Al", "client": "iPhone"}, a.now_playing()
+    # same snapshot again: no material change
+    assert a.apply(ap_snapshot("Playing", title="T", artist=["A", "B"], album="Al",
+                               client="iPhone")) is False
+    assert a.apply(ap_snapshot("Paused", title="T")) and a.status == "paused"
+    # Playing before the Active edge lands still counts as a live session
+    a.apply(ap_snapshot("Playing", active=False, title="T"))
+    assert a.status == "playing", a.status
+    # session over: shairport keeps the old metadata, we must not
+    a.apply(ap_snapshot("Stopped", active=False, title="old"))
+    assert a.now_playing() == {"status": "idle", "title": None, "artist": None,
+                               "album": None, "client": None}, a.now_playing()
+    # shairport gone from the bus while playing -> idle
+    a.apply(ap_snapshot("Playing", title="T"))
+    a.apply(ap_snapshot("Playing", present=False, title="T"))
+    assert a.status == "idle" and a.title is None
+    print("airplay_state_mapping: PASS")
+
+
+async def test_airplay_remote_routing(tmp):
+    """HA's AirPlay buttons arrive on MQTT and leave over D-Bus; nothing
+    subscribes to shairport's old MQTT topics any more."""
+    app = make_app(tmp)
+    subs = [t for t, _ in app._orig_subs]
+    assert app.cfg.topic("airplay", "remote") in subs, subs
+    assert app.cfg.topic("airplay", "#") not in subs, subs
+    app.shairport = FakeShairport()
+    app.handle_message(app.cfg.topic("airplay", "remote"), b"nextitem", False)
+    app.handle_message(app.cfg.topic("airplay", "remote"), b"playpause", True)  # retained
+    assert app.shairport.sent == ["nextitem"], app.shairport.sent
+    # our own published now_playing is not a command
+    app.handle_message(app.cfg.topic("airplay", "now_playing"), b"{}", False)
+    assert app.shairport.sent == ["nextitem"], app.shairport.sent
+    from speakerd.shairport import COMMANDS
+    assert COMMANDS["nextitem"] == COMMANDS["next"] == "Next"
+    assert COMMANDS["previtem"] == COMMANDS["previous"] == "Previous"
+    print("airplay_remote_routing: PASS")
+
+
+async def test_standalone_config(tmp):
+    """No [mqtt] and no [[devices]]: an AirPlay-only node with no broker."""
+    from speakerd.mqtt_link import NullMqttLink
+    path = os.path.join(tmp, "standalone.toml")
+    with open(path, "w") as f:
+        f.write('[bluetooth]\namp_mac = "00:00:00:00:00:AA"\n'
+                'amp_metadata_export = true\n[airplay]\nenabled = true\n')
+    cfg = config_mod.load(path)
+    assert cfg.mqtt_enabled is False and cfg.host is None, cfg
+    assert cfg.ios_devices == () and cfg.base_topic == "nowairplaying"
+    app = App(cfg, asyncio.get_event_loop())
+    assert isinstance(app.mqtt, NullMqttLink), type(app.mqtt)
+    assert app.shairport is not None
+    app.republish_all()  # must be a harmless no-op
+    # AirPlay still reaches the amp screen with no broker at all
+    app._airplay_changed(ap_snapshot("Playing", title="Standalone Song"))
+    assert app.amp_export._player.Metadata["xesam:title"].value == "Standalone Song"
+    # [mqtt] present but incomplete is still an error, even an empty one;
+    # enabled = false is not
+    with open(path, "a") as f:
+        f.write('[mqtt]\n')
+    try:
+        config_mod.load(path)
+    except config_mod.ConfigError as e:
+        assert "host" in str(e), e
+    else:
+        raise AssertionError("empty [mqtt] should have been rejected")
+    with open(path, "a") as f:
+        f.write('host = "x"\n')
+    try:
+        config_mod.load(path)
+    except config_mod.ConfigError as e:
+        assert "username" in str(e) and "password" in str(e), e
+    else:
+        raise AssertionError("incomplete [mqtt] should have been rejected")
+    with open(path, "a") as f:
+        f.write('enabled = false\n')
+    assert config_mod.load(path).mqtt_enabled is False
+    print("standalone_config: PASS")
+
+
 async def main():
     # expose fake-sudo.sh as `sudo` ahead of the real one, so no manual PATH setup is needed
     with tempfile.TemporaryDirectory() as fake_bin:
@@ -546,7 +654,9 @@ async def main():
                      test_discovery_unchanged, test_node_overrides,
                      test_announce_payload, test_announce_republished,
                      test_amp_export_mapping, test_amp_export_arbitration,
-                     test_amp_export_reconnect_hygiene):
+                     test_amp_export_reconnect_hygiene,
+                     test_airplay_state_mapping, test_airplay_remote_routing,
+                     test_standalone_config):
             with tempfile.TemporaryDirectory() as tmp:
                 await test(tmp)
 

@@ -88,6 +88,8 @@ def build_discovery(cfg: Config) -> list[tuple[str, str]]:
             "icon": icon,
             "command_topic": cfg.topic("bt", "transport", "set"),
             "payload_press": payload,
+            # QoS 0 on both ends (see __main__): a stale press must not replay
+            "qos": 0,
         }))
 
     entities.append(("sensor", "source", {
@@ -104,7 +106,7 @@ def build_discovery(cfg: Config) -> list[tuple[str, str]]:
             "value_template": "{{ value_json.status }}",
             "json_attributes_topic": cfg.topic("airplay", "now_playing"),
         }))
-        # shairport-sync consumes these directly on <base>/airplay/remote
+        # speakerd relays these from <base>/airplay/remote to shairport-sync over D-Bus
         for object_id, name, icon, payload in (
             ("airplay_playpause", "AirPlay Play/Pause", "mdi:play-pause", "playpause"),
             ("airplay_next", "AirPlay Next Track", "mdi:skip-next", "nextitem"),
@@ -115,6 +117,7 @@ def build_discovery(cfg: Config) -> list[tuple[str, str]]:
                 "icon": icon,
                 "command_topic": cfg.topic("airplay", "remote"),
                 "payload_press": payload,
+                "qos": 0,
             }))
 
     if cfg.power_commands:
@@ -213,9 +216,11 @@ def build_announce(cfg: Config) -> tuple[str, str]:
             "amp_auto_reconnect": True,
             "amp_metadata_export": cfg.amp_metadata_export,
         },
-        # QoS the consumer must publish with: system/* is 0 by design — a
-        # broker-queued power press must never reach the daemon on reconnect
-        "command_qos": {"default": 1, "system": 0},
+        # QoS the consumer must publish with: system/*, bt/transport/set and
+        # airplay/remote are 0 by design — a broker-queued button press must
+        # never reach the daemon on reconnect
+        "command_qos": {"default": 1, "system": 0, "bt/transport": 0,
+                        "airplay/remote": 0},
         "topics": topics,
         # the amp is commandable on device/amp/set like any device, but it is
         # discovered as a binary_sensor, not a switch
