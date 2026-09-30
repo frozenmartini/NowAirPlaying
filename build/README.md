@@ -36,6 +36,16 @@ sudo SUITE=trixie PI_KEY=/path/to/raspberrypi-archive-keyring.pgp build/build.sh
   keeps 5.87 buildable as a fallback. Bookworm's flags are unchanged.
 - `vendor.sh` and `test-install.sh` are bookworm-only.
 
+## Release
+
+```
+git tag v$(cat VERSION)      # on a clean, committed tree
+build/release.sh             # -> dist/nowairplaying-<ver>-trixie-arm64.tar.gz + .sha256
+```
+
+Upload both files to the GitHub release of that tag. `install/bootstrap.sh` fetches the
+tarball and checks it against the pinned hash ([INSTALL-STATE](../docs/INSTALL-STATE.md)).
+
 ## Vendored PipeWire and WirePlumber
 
 PipeWire must be at least 1.4. The Pi archive's 1.2.7 accepts the phone's volume but

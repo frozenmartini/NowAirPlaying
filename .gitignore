@@ -12,3 +12,6 @@ build/out/
 *.deb
 *.img
 *.img.xz
+
+# release assets (build/release.sh)
+dist/

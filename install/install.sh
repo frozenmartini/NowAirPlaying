@@ -4,6 +4,8 @@
 # Six phases (docs/ROADMAP.md). Each one checks before it acts, so a re-run
 # is safe and a failed run resumes where it stopped:
 #   1 preflight   2 apt   3 packages   4 units   5 configure   6 verify
+# Every install run records its progress in /var/lib/nowairplaying/install.json
+# (docs/INSTALL-STATE.md). install/bootstrap.sh fetches a release and runs this.
 #
 # Runs from a copy of this repo that carries the built packages
 # (build/README.md), or from --packages DIR laid out the same way:
@@ -13,53 +15,54 @@
 #
 # Usage:
 #   sudo install/install.sh [--amp-mac AA:BB:CC:DD:EE:FF] [--name "Now AirPlaying"]
-#                           [--user NAME] [--packages DIR] [--force]
+#                           [--phones onboard|dongle] [--user NAME]
+#                           [--packages DIR] [--force]
 #   sudo install/install.sh --verify        # phase 6 only
 #
 # Without --amp-mac everything is installed but speakerd stays off, and the
 # script ends with the pairing checklist. Pair, then re-run with --amp-mac.
+# --phones is accepted for phone Bluetooth, which is not built yet: so far it
+# changes nothing.
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(dirname "$HERE")
-LOG=/var/log/nowairplaying-install.log
+LOG=${NAP_LOG:-/var/log/nowairplaying-install.log}
+VERSION=$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)
 
-usage() { sed -n '14,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '16,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 say()  { printf '\n== %s\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" = 0 ] || die "run with sudo: sudo $0 $*"
 
-# everything also goes to $LOG, with the script's own exit status kept
-if [ -z "${NAP_LOGGING:-}" ]; then
-    rc=$(mktemp)
-    # set +e: under -e a failing run would end this group before it records $?
-    { set +e; NAP_LOGGING=1 sh "$0" "$@"; echo $? > "$rc"; } 2>&1 | tee -a "$LOG"
-    status=$(cat "$rc"); rm -f "$rc"
-    exit "${status:-1}"
-fi
-printf '\n##### %s  %s %s\n' "$(date -Is)" "$0" "$*"
-
 USER_NAME=${SUDO_USER:-}
 AMP_MAC=
 AIRPLAY_NAME=
+PHONES=onboard
 PKGS=
 FORCE=0
 VERIFY_ONLY=0
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --amp-mac)    [ $# -ge 2 ] || usage 2; AMP_MAC=$2; shift ;;
-        --name)       [ $# -ge 2 ] || usage 2; AIRPLAY_NAME=$2; shift ;;
-        --user)       [ $# -ge 2 ] || usage 2; USER_NAME=$2; shift ;;
-        --packages)   [ $# -ge 2 ] || usage 2; PKGS=$2; shift ;;
-        --force)      FORCE=1 ;;
-        --verify)     VERIFY_ONLY=1 ;;
-        -h|--help)    usage ;;
-        *)            echo "unknown option: $1" >&2; usage 2 ;;
-    esac
-    shift
-done
+ARGS="$*"
+# a function, so its shifts leave the script's own "$@" for the re-run below
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --amp-mac)    [ $# -ge 2 ] || usage 2; AMP_MAC=$2; shift ;;
+            --name)       [ $# -ge 2 ] || usage 2; AIRPLAY_NAME=$2; shift ;;
+            --phones)     [ $# -ge 2 ] || usage 2; PHONES=$2; shift ;;
+            --user)       [ $# -ge 2 ] || usage 2; USER_NAME=$2; shift ;;
+            --packages)   [ $# -ge 2 ] || usage 2; PKGS=$2; shift ;;
+            --force)      FORCE=1 ;;
+            --verify)     VERIFY_ONLY=1 ;;
+            -h|--help)    usage ;;
+            *)            echo "unknown option: $1" >&2; usage 2 ;;
+        esac
+        shift
+    done
+}
+parse_args "$@"
 
 if [ -n "$AMP_MAC" ]; then
     AMP_MAC=$(printf '%s' "$AMP_MAC" | tr 'a-f-' 'A-F:')
@@ -68,7 +71,31 @@ if [ -n "$AMP_MAC" ]; then
     [ "$AMP_MAC" != 00:00:00:00:00:00 ] || die "--amp-mac: 00:00:00:00:00:00 is the placeholder"
 fi
 case "$AIRPLAY_NAME" in *'"'*|*'\'*|*/*|*'&'*) die "--name: no quotes, backslashes, / or &" ;; esac
+case "$PHONES" in onboard|dongle) ;; *) die "--phones: onboard or dongle, not $PHONES" ;; esac
 case "$PKGS" in *[[:space:]]*) die "--packages: the path must not contain spaces" ;; esac
+
+# shellcheck source=status.sh
+. "$HERE/status.sh"
+STARTED=${NAP_STARTED:-$(date -Is)}
+LOG_OFFSET=${NAP_LOG_OFFSET:-$(log_size)}
+
+# phase N NAME: record an install run's progress (--verify only reads)
+phase() { [ "$VERIFY_ONLY" = 1 ] || write_status installing "$1" "$2" "" "" ""; }
+
+# everything also goes to $LOG, with the script's own exit status kept, and
+# install.json gets the run's final state
+if [ -z "${NAP_LOGGING:-}" ]; then
+    phase 1 preflight
+    rc=$(mktemp)
+    # set +e: under -e a failing run would end this group before it records $?
+    { set +e; NAP_LOGGING=1 NAP_STARTED=$STARTED NAP_LOG_OFFSET=$LOG_OFFSET NAP_LOG=$LOG \
+        sh "$0" "$@"; echo $? > "$rc"; } 2>&1 | tee -a "$LOG"
+    status=$(cat "$rc"); rm -f "$rc"
+    [ "$VERIFY_ONLY" = 1 ] || finish_status "${status:-1}"
+    exit "${status:-1}"
+fi
+printf '\n##### %s  %s %s\n' "$(date -Is)" "$0" "$ARGS"
+info "NowAirPlaying $VERSION"
 
 # ---------------------------------------------------------------- helpers
 
@@ -183,6 +210,7 @@ SYS_PKGS="dbus-user-session python3-dbus-next python3-paho-mqtt avahi-daemon lib
 # ---------------------------------------------------------------- 1 preflight
 
 preflight() {
+    phase 1 preflight
     say "1/6 Preflight"
     model=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
     case "$model" in
@@ -230,6 +258,7 @@ preflight() {
 # ---------------------------------------------------------------- 2 apt
 
 phase_apt() {
+    phase 2 apt
     say "2/6 PipeWire, WirePlumber and system packages"
     need=
     for f in $VENDOR_DEBS; do deb_current "$f" || need=1; done
@@ -252,6 +281,7 @@ phase_apt() {
 # ---------------------------------------------------------------- 3 packages
 
 phase_packages() {
+    phase 3 packages
     if [ "$OWN_BLUEZ" = 1 ]; then
         say "3/6 BlueZ $BLUEZ_VERSION, nqptp $NQPTP_VERSION, shairport-sync $SHAIRPORT_VERSION"
     else
@@ -276,6 +306,7 @@ phase_packages() {
 # ---------------------------------------------------------------- 4 units
 
 phase_units() {
+    phase 4 units
     say "4/6 speakerd and the user units"
     if ! diff -rq -x __pycache__ "$REPO/speakerd" /opt/nowairplaying/speakerd >/dev/null 2>&1; then
         rm -rf /opt/nowairplaying/speakerd
@@ -326,6 +357,7 @@ as_user_mkdir() { runuser -u "$USER_NAME" -- mkdir -p "$@"; }
 # ---------------------------------------------------------------- 5 configure
 
 phase_configure() {
+    phase 5 configure
     say "5/6 Configuration"
 
     # BlueZ [AVRCP]: the Kohler advertises no AVRCP Target record, so without
@@ -451,6 +483,7 @@ within() {
 }
 
 verify() {
+    phase 6 verify
     say "6/6 Verify: the running system"
 
     pid=$(systemctl show -p MainPID --value bluetooth.service)
