@@ -2,10 +2,10 @@
 
 **Status: draft for review. Nothing here is implemented yet.**
 
-**Superseded in part (2026-09-28):** the "Wi-Fi first" flow and every mention of the
-comitup hotspot below are dropped. The setup now starts in Home Assistant (see
-[ROADMAP](ROADMAP.md#3-guided-setup)). Whether Home Assistant uses this API or SSH is
-still open. The pairing facts under `POST /bt/pair` were confirmed on a real amp.
+**Setup starts in Home Assistant (2026-09-28).** Its integration gives the user what
+they need to flash the card (see [ROADMAP](ROADMAP.md#3-guided-setup)). Whether Home
+Assistant then uses this API or SSH is still open. The pairing facts under
+`POST /bt/pair` were confirmed on a real amp.
 
 A NowAirPlaying node is set up over the home network through one small HTTP API.
 Two clients use the same API:
@@ -21,39 +21,24 @@ The API can do a short list of things and nothing else.
 
 - **Local only.** The API serves the home network and nothing else: no cloud, no
   port forwarding, no remote access.
-- **Never on the setup hotspot.** While the Pi is in its open setup hotspot, the API
-  is not running at all. See [Wi-Fi first](#wi-fi-first).
 - **Plain HTTP.** See [Why HTTP, not HTTPS](#why-http-not-https).
 - **Least privilege.** The service runs as the node's normal user, not root. It holds
   one extra capability: binding port 80.
 - **One API, two clients.** The setup page is plain HTML and JavaScript calling the
   same endpoints Home Assistant calls, so both paths are tested by the same code.
 
-## Wi-Fi first
+## Getting on the network
 
-The API only exists once the node is on the home network.
-
-1. **First boot:** with no Ethernet and no known Wi-Fi, comitup brings up an open
-   hotspot named `NowAirPlaying-<nnnn>`, where `<nnnn>` is a persistent per-device
-   number. The hotspot's address is `10.41.0.1`.
-2. **Pick a network:** the user joins the hotspot from a phone, and comitup's own page
-   lists nearby networks. They pick theirs and enter the password.
-3. **The Pi joins that network** and drops the hotspot.
-
-comitup's `web_service` option names a systemd service that comitup stops while the
-hotspot is up and starts once the Pi is on a real network. That service is
-`nowairplaying-setup.service`. It is left disabled in systemd so that comitup alone
-manages it, and so the API is never reachable from the open hotspot. With Ethernet the
-hotspot never appears, and the service simply runs. The Ethernet case is still to be
-confirmed on a real Pi.
+The node joins the home network by Ethernet, or by the Wi-Fi that Raspberry Pi Imager
+sets when the card is flashed. The API runs whenever the node is up.
 
 ## The service
 
 | | |
 |---|---|
 | Unit | `nowairplaying-setup.service` (a system unit with `User=` the node user and `AmbientCapabilities=CAP_NET_BIND_SERVICE`) |
-| Listens on | port 80, all interfaces (only ever up while the Pi is on the home network) |
-| Address | `http://nowairplaying-<nnnn>.local/`. comitup publishes the same name as the hotspot as the Pi's `.local` host name. |
+| Listens on | port 80, all interfaces |
+| Address | `http://<hostname>.local/`, the Pi's host name, set in Raspberry Pi Imager and published by avahi. |
 | State file | `~/.config/nowairplaying/setup.json`, mode 0600 |
 | Writes | `~/.config/speakerd/config.toml` (the `[mqtt]`, `[node]` and `[bluetooth]` amp settings), then restarts the speakerd user service |
 
@@ -61,8 +46,7 @@ confirmed on a real Pi.
 
 The node advertises itself with mDNS/zeroconf:
 
-- **Service type:** `_nowairplaying._tcp`, port 80. This replaces the earlier
-  placeholder `_chorus-setup._tcp`; the public name should say what the device is.
+- **Service type:** `_nowairplaying._tcp`, port 80.
 - **Instance name:** the node's display name, e.g. `Bathroom Speaker`.
 - **TXT records:**
 
@@ -201,8 +185,10 @@ Same `mqtt` object as `/claim`. Replaces the login and restarts speakerd. `200` 
   fixed PIN `0000`. The node's agent must answer BlueZ's `RequestPinCode` with it. A
   NoInputNoOutput agent fails with `org.bluez.Error.AuthenticationFailed`.
 - `200` → `{"ok": true}`, or `502 pair_failed` with the BlueZ error in `message`.
-- **To confirm on a real amp:** how its pairing mode is entered, for the setup page's
-  instructions.
+- **Pairing mode on the Kohler** (tested 2026-09-29): the amp has no pairing button.
+  Pairing mode started on the Anthem+ screen works. Removing a device on the screen
+  unpairs **every** device, not just that one. Whether the amp can be paired
+  without the screen, for example after a power cycle, is not yet known.
 
 ### `POST /bt/connect`, `POST /bt/disconnect`, `POST /bt/forget`
 
@@ -258,7 +244,7 @@ Every error is JSON: `{"error": "<code>", "message": "<human text>"}`.
 
 ## The setup page
 
-At `http://nowairplaying-<nnnn>.local/` the node serves one plain page with no
+At `http://<hostname>.local/` the node serves one plain page with no
 framework, which calls the endpoints above:
 
 1. **Status:** name, amp connected or not, and the verify checks as green or red.

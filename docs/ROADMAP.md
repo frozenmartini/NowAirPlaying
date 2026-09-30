@@ -113,13 +113,11 @@ MQTT login, pairs it with the amplifier, and runs the verify checks. Both use on
 HTTP API on the node. The draft contract is
 [SETUP-API.md](SETUP-API.md).
 
-**Being redesigned (2026-09-28).** The first-boot setup hotspot (comitup) is
-dropped. The setup now starts in Home Assistant, whose integration gives the user
-what they need to flash the card. The rest of that journey is still being planned.
+**Setup starts in Home Assistant (2026-09-28).** The rest of that journey is still
+being planned.
 
-For Wi-Fi, the node uses Ethernet or the Wi-Fi set when the card is flashed.
-Raspberry Pi Imager's Wi-Fi settings have documented failures on bookworm, and on the
-trixie test card they worked.
+The card is flashed with Raspberry Pi Imager, which sets the Wi-Fi, host name, user,
+password and SSH public key on trixie. The node uses that Wi-Fi or Ethernet.
 
 **Proven so far,** in a simulation of what Home Assistant would do over SSH:
 - HA logs in with its own key.

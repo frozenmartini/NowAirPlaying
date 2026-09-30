@@ -32,14 +32,14 @@ Also needed:
 - The official Raspberry Pi power supply for your board.
 - A microSD card of 16 GB or more.
 - Wi-Fi or Ethernet. Ethernet helps where Wi-Fi is weak.
-- A spot within Bluetooth range of the amplifier. The Pi's own radio is enough; a USB
-  Bluetooth adapter is only needed for extra range, for example through tiled walls.
+- A spot within Bluetooth range of the amplifier.
 
 **Operating system:** Raspberry Pi OS **Lite** 64-bit, with no desktop: Debian 13
-trixie (tested end to end on a Pi 4) or Debian 12 bookworm. The Pi runs without a
-screen or keyboard, and gets its Wi-Fi from Raspberry Pi Imager's settings or uses
-Ethernet. A setup that needs no terminal, led by Home Assistant, is being designed
-(see [ROADMAP](docs/ROADMAP.md)). The desktop edition is not supported, because it
+trixie (tested end to end on a Pi 4). Debian 12 bookworm is kept as a fallback. The Pi
+runs without a screen or keyboard, on Ethernet or Wi-Fi. Raspberry Pi Imager sets the
+Wi-Fi, host name, user, password and SSH key when you flash the card. A setup that
+needs no terminal, led by Home Assistant, is being designed (see
+[ROADMAP](docs/ROADMAP.md)). The desktop edition is not supported, because it
 runs a second audio session for the desktop user and uses a lot more memory.
 
 **What it needs from the Pi,** measured on a Pi 5 during the heaviest case (lossless
@@ -78,9 +78,9 @@ iPhone ──AirPlay 2──▶ shairport-sync + nqptp ──▶ PipeWire ──
   client on the node, and the screen keeps working when the broker is down.
 
 AirPlay needs no pairing between the phone and the Pi. Bluetooth streaming from a
-phone (for example Android, which has no AirPlay) is planned, through the Pi's own
-radio or an optional USB Bluetooth adapter. It matters because the Pi holds the amp's
-only Bluetooth link, so phones can no longer connect to the amp directly.
+phone (for example Android, which has no AirPlay) is planned. It matters because the
+Pi holds the amp's only Bluetooth link, so phones can no longer connect to the amp
+directly.
 
 ## Trademarks
 
