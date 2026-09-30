@@ -137,6 +137,31 @@ on bookworm (backports drops old versions; trixie's archive has the right ones),
 the apt holds. Releases are rebuilt deliberately
 and published as GitHub releases, with a GPL source offer for each one.
 
+## 5. Phone Bluetooth
+
+Phones without AirPlay stream to the Pi over Bluetooth. Nothing is built yet.
+
+- **One radio.** The Pi's onboard radio holds the amp and takes phones at the same
+  time. An earlier one-radio prototype worked; the first step is to repeat that by
+  hand on trixie, before any code.
+- **Identity:**
+  - the Bluetooth name is `Bluetooth <name>`, so it differs from the AirPlay name;
+  - classic Bluetooth only, with LE off;
+  - media only, with no phone-call roles.
+- **Pairing:**
+  - opens only from a Home Assistant button, for 120 s;
+  - speakerd's own agent answers the phone, and PIN 0000 for the amp.
+  - Home Assistant learns each paired phone's address over MQTT.
+- **Playing:**
+  - several phones stay connected, and their audio is mixed;
+  - the amp's screen shows whichever source sent track info last, AirPlay
+    included;
+  - audio never falls back to the headphone jack.
+- **Releasing the amp:**
+  - a Home Assistant switch disconnects the amp and blocks it on the Pi, so a
+    phone can use the amp directly;
+  - while the amp is released, phones are paused too.
+
 ## Open design questions
 
 - **The D-Bus link is not yet tested with a real shairport-sync.** The tests run

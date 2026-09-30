@@ -80,7 +80,10 @@ iPhone ──AirPlay 2──▶ shairport-sync + nqptp ──▶ PipeWire ──
 AirPlay needs no pairing between the phone and the Pi. Bluetooth streaming from a
 phone (for example Android, which has no AirPlay) is planned. It matters because the
 Pi holds the amp's only Bluetooth link, so phones can no longer connect to the amp
-directly.
+directly. The plan:
+- Phones pair with the Pi's own Bluetooth radio, which also holds the amp.
+- A Home Assistant switch lets the Pi release the amp, so a phone can connect to
+  it directly.
 
 ## Trademarks
 
