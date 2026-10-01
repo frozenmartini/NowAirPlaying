@@ -3,9 +3,11 @@
 **Status: draft for review. Nothing here is implemented yet.**
 
 **Setup starts in Home Assistant (2026-09-28).** Its integration gives the user what
-they need to flash the card (see [ROADMAP](ROADMAP.md#3-guided-setup)). Whether Home
-Assistant then uses this API or SSH is still open. The pairing facts under
-`POST /bt/pair` were confirmed on a real amp.
+they need to flash the card (see [ROADMAP](ROADMAP.md#3-guided-setup)).
+
+**SSH for the install only, then this API (agreed 2026-09-30).** Home Assistant
+installs over SSH ([INSTALL-STATE](INSTALL-STATE.md)), then uses this API for
+everything else. The pairing facts under `POST /bt/pair` were confirmed on a real amp.
 
 A NowAirPlaying node is set up over the home network through one small HTTP API.
 Two clients use the same API:
@@ -56,7 +58,7 @@ The node advertises itself with mDNS/zeroconf:
 | `ver` | `1.0.0` | NowAirPlaying release |
 | `mac` | `B8:27:EB:12:34:56` | the Pi's Bluetooth adapter MAC, uppercase with colons. Home Assistant uses it as the config entry's `unique_id` and as the device-card `bluetooth` connection. |
 | `id` | `nowairplaying_123456` | node id: stable, derived from the MAC, never renamed |
-| `state` | `unclaimed` | `unclaimed` or `claimed` |
+| `state` | `unclaimed` | `unclaimed` or `claimed`. The install itself is tracked in `install.json` ([INSTALL-STATE](INSTALL-STATE.md)), because this record only exists once the install is done |
 
 Home Assistant's manifest matches `_nowairplaying._tcp.local.` and offers "New audio
 node found" for `state=unclaimed`.
@@ -70,8 +72,17 @@ node found" for `state=unclaimed`.
 
 - **A standalone node stays unclaimed.** The home network is trusted for a device you
   just set up yourself, the same way a new speaker or streaming stick is.
-- **Claiming** is the one step that locks the node to one Home Assistant. The first
-  claimer wins.
+- **Claiming** is the one step that locks the node to one Home Assistant.
+  - **A planted claim token, when present.** Before the install, Home Assistant writes
+    `~/.config/nowairplaying/claim-token` over SSH.
+    - The file holds the lowercase hex SHA-256 of 32 random bytes. It is mode 0600.
+    - `/claim` then needs `Authorization: Bearer <the 64-hex bytes>`.
+    - The file is read on **every** `/claim` request, never once at startup. Whitespace
+      around its contents is ignored.
+    - A successful claim deletes it.
+    - `GET /info` reports `"claim": "token"` or `"open"`.
+  - **Otherwise the first claimer wins.** That covers a node installed by hand and found
+    by Home Assistant through zeroconf.
 - **Releasing a claim:**
   - **From Home Assistant:** deleting the node's config entry calls `POST /release`.
   - **Without Home Assistant**, for example if it's gone for good: power the Pi off, put
@@ -274,11 +285,16 @@ framework, which calls the endpoints above:
 
 These go to Home Assistant's integration owner:
 
-1. `_nowairplaying._tcp` as the service type, and `mac` as the `unique_id`: agreed?
+1. ~~`_nowairplaying._tcp` as the service type, and `mac` as the `unique_id`~~: agreed
+   2026-09-30. The TXT fields are final for API v1. `mac` is always the onboard adapter
+   (`hci0`), and `"phones"` (`onboard` or `dongle`) goes in `GET /info`.
 2. Deleting the config entry calls `POST /release`. If the node is unreachable at that
    moment, the entry is still removed, and the reset file is the fallback. Acceptable?
 3. Should the integration rotate the MQTT login via `POST /mqtt`, or is one login per
    claim enough?
-4. Which `/verify` check ids should raise a repair issue, and which should only show on
+4. **Answered 2026-09-30:** only a check that used to pass and then fails several runs
+   in a row raises a repair: AirPlay 2, PipeWire, nqptp, mDNS, speakerd. So does
+   "amp not paired". `amp_connected`, the player and MQTT show on the card only. The
+   original question: which `/verify` check ids should raise a repair issue, and which should only show on
    the device page? `amp_connected` probably shouldn't raise one, since a sleeping amp
    is normal.

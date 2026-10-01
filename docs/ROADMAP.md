@@ -1,8 +1,8 @@
 # Roadmap
 
 The order runs from the cheapest win to the most work: a working installer first,
-then guided setup, then the flashable image. The image is generated from the
-installer's recipe, so the recipe stays the single source of truth.
+then guided setup. NowAirPlaying installs onto stock Raspberry Pi OS Lite trixie from a
+pinned release. There is no flashable image (decided 2026-09-30).
 
 ## 1. The installer
 
@@ -17,7 +17,9 @@ The bookworm path has not been run on a real Pi yet.
 
 It has six phases, and each one checks before it acts, so a re-run is safe and a failed run
 resumes where it stopped. `--verify` runs phase 6 alone. The log goes to
-`/var/log/nowairplaying-install.log`.
+`/var/log/nowairplaying-install.log`. Each install run also records its phase and
+final result in `/var/lib/nowairplaying/install.json`, which Home Assistant reads to
+follow or rejoin an install ([INSTALL-STATE](INSTALL-STATE.md)).
 
 | Phase | What it does |
 |---|---|
@@ -127,15 +129,31 @@ password and SSH public key on trixie. The node uses that Wi-Fi or Ethernet.
   can't kill it, and follows its log.
 - Pairing the Kohler worked the same way.
 
-Whether HA drives setup over SSH or over the setup API is still open.
+**Agreed with the integration, 2026-09-30** (`kohler-anthem-plus#003`):
+- **SSH is used for the install only.**
+  - HA plants a one-time claim token.
+  - It then uploads `install/bootstrap.sh` and runs it as root under `systemd-run`.
+  - The bootstrap fetches the pinned release and checks its hash.
+  - HA follows `install.json` and the log ([INSTALL-STATE](INSTALL-STATE.md)).
+- **After the install, everything goes through the setup API:** claim, amp pairing and
+  verify. HA's claim carries the planted token.
+- **`v0.0.1`** (2026-09-30) is the first fetchable release. It covers the install path
+  only. Not built yet:
+  - speakerd and the setup service starting with no amp;
+  - the setup API and the claim token.
 
-## 4. The image
+## 4. Releases
 
-A fat, versioned image built with `rpi-image-gen`, never cloned from a live card. It
-carries the exact tested package set, including the PipeWire and WirePlumber debs
-on bookworm (backports drops old versions; trixie's archive has the right ones), and
-the apt holds. Releases are rebuilt deliberately
-and published as GitHub releases, with a GPL source offer for each one.
+**No image (decided 2026-09-30).** Stock Pi OS Lite trixie plus the installer.
+
+**Each release:**
+- is a GitHub release `v<ver>`;
+- carries `nowairplaying-<ver>-trixie-arm64.tar.gz` (the tagged tree plus the built
+  trixie packages) and its `.sha256`;
+- is built reproducibly by `build/release.sh`.
+
+**Home Assistant's integration pins one release and its hash per version.** A GPL
+source offer for the packaged binaries is still owed.
 
 ## 5. Phone Bluetooth
 

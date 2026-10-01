@@ -8,9 +8,12 @@ Kohler amplifier over Bluetooth. While it plays, the Pi sends the now-playing
 information to the amplifier, so the Anthem+ touchscreen shows what's playing and
 its play/pause and skip buttons control the source.
 
-> **Status: under construction. Not installable yet.** This repo is being extracted
-> from a working two-node home setup. There is no installer and no image release
-> yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status: under construction. Not ready for general use.**
+> - The installer works on stock Raspberry Pi OS Lite trixie.
+> - `v0.0.1` is a test release for the Home Assistant install path.
+> - Guided setup and phone Bluetooth are not built yet.
+>
+> See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Hardware
 
@@ -93,6 +96,6 @@ sponsored by Apple or Kohler.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The published image will also contain third-party
-software under its own licenses, including GPL components such as BlueZ and the
-Linux kernel. Each image release will say where to get their source.
+MIT, see [LICENSE](LICENSE). Each release also carries packages built from
+third-party sources under their own licenses: shairport-sync and nqptp, and BlueZ
+(GPL) on bookworm. The pinned sources are listed in `build/versions.env`.
