@@ -12,6 +12,9 @@ in 2026-09.
   - The tag has the `v`; the file name doesn't.
 - **Contents:** the tagged tree plus the built trixie packages, under one top directory
   `nowairplaying-<ver>/`, which carries a `VERSION` file. `build/release.sh` makes it.
+- **The bootstrap** (from `0.0.4`): `nowairplaying-bootstrap-<ver>.sh` and its
+  `.sha256`, in the same release. It is the tag's `install/bootstrap.sh`, so HA can pin
+  it from the release like the tarball.
 - **Pinned:** each `kohler_anthem_plus` version pins one release version and its
   SHA-256. Nothing follows "latest".
 
@@ -46,6 +49,8 @@ LC_ALL=C sudo -S -k -p '' systemd-run --unit=nowairplaying-install --collect --q
 
 **What it does:**
 1. Checks the options. A bad option is recorded as `failed` / `bad_arguments`.
+   From `0.0.4`, a `--version` older than the installed one is refused as `failed` /
+   `downgrade`, the same rule as an update. The same version is allowed, as a repair.
 2. Writes `install.json` as `installing`, phase 0 `download`.
 3. Downloads into a fresh `mktemp -d` and checks the SHA-256.
 4. Unpacks into `/opt/nowairplaying/<ver>`, replacing an earlier unpack of the same
@@ -70,7 +75,7 @@ same file.
  "started": "2026-10-01T14:03:11-07:00", "finished": "2026-10-01T14:03:40-07:00", "exit": 22,
  "reason": "download_failed", "message": "curl: (22) The requested URL returned error: 404",
  "log": "/var/log/nowairplaying-install.log", "log_offset": 48213,
- "cert_sha256": null, "rolled_back": false}
+ "cert_sha256": null, "rolled_back": false, "installed": null}
 ```
 
 | Field | Meaning |
@@ -85,6 +90,7 @@ same file.
 | `log`, `log_offset` | the log, 0644 and appended across runs, and the byte where this run starts |
 | `cert_sha256` | from `0.0.2`: the SHA-256 of the API certificate in DER form, lowercase hex, on every write once the certificate exists, so it always matches what the API serves. HA pins it, at the install and again on Reconnect ([SETUP-API](SETUP-API.md#trust-the-pinned-certificate)). `null` before the certificate is made |
 | `rolled_back` | `true` when an update failed verify and the previous release was reinstalled |
+| `installed` | from `0.0.4`: the release that last finished `done`, kept across every later write. A failed, refused or rolled-back run doesn't change it. `null` before the first `done`. In a file from an earlier release, read `version` when `state` is `done` |
 
 - **`preflight_conflict`** means the Pi already runs something NowAirPlaying would
   break: a desktop, another AirPlay receiver, or another program on our ports (8443,
@@ -98,11 +104,14 @@ same file.
 
 ## What a new setup flow does
 
-After the SSH login, HA looks at the unit first and then at the file:
+After the SSH login, HA looks at the unit first and then at the file. **Check
+`installed` before `state`:** a refused downgrade is written as `failed` / `downgrade`,
+and re-running it would only fail again.
 
 | `install.json` | unit | HA does |
 |---|---|---|
 | missing | – | a fresh install |
+| `installed` newer than the pin (any `state`) | not active | claim it; the bootstrap refuses to go back |
 | `installing` | active | rejoin: follow the log from `log_offset`; no password needed |
 | `installing` | not active | the Pi rebooted mid-run, or the run was killed: treat it as `failed` |
 | `failed` | – | show `message` and the log's last lines, then offer a re-run |

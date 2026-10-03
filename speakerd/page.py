@@ -47,6 +47,7 @@ PAGE = """<!doctype html>
     <p id="amp" class="muted">…</p>
     <button id="ampConnect">Connect</button>
     <button id="ampDisconnect">Disconnect</button>
+    <button id="audioRestart">Restart audio</button>
     <span class="owner"><button id="ampReconnect">Reconnect</button>
     <button id="ampForget">Forget</button></span>
   </section>
@@ -110,7 +111,8 @@ async function refresh() {
   document.querySelectorAll(".owner").forEach(el => el.hidden = claimed);
   const amp = info.amp;
   $("amp").textContent = amp
-    ? amp.name + " — " + (amp.connected ? "connected" : "not connected")
+    ? amp.name + " — " + (!amp.connected ? "not connected"
+                          : amp.audio === false ? "connected, but no audio link" : "connected")
     : "No amplifier paired yet.";
   $("ampConnect").disabled = $("ampDisconnect").disabled = !amp;
   if (!claimed) {
@@ -158,6 +160,13 @@ async function showFound() {
 $("ampConnect").onclick = () => act("Connect", () => call("POST", "/amp/connect"));
 $("ampDisconnect").onclick = () => act("Disconnect", () => call("POST", "/amp/disconnect"));
 $("ampReconnect").onclick = () => act("Reconnect", () => call("POST", "/amp/reconnect"));
+$("audioRestart").onclick = async () => {
+  say("Restarting audio…");
+  try {
+    await call("POST", "/audio/restart");
+    say("Restarting audio: the sound comes back in about 10 to 30 seconds");
+  } catch (e) { say("Restart audio: " + e.message); }
+};
 $("ampForget").onclick = () => { if (confirm("Forget the amplifier?")) act("Forget", () => call("POST", "/amp/forget")); };
 $("scan").onclick = () => act("Scan", async () => { await call("POST", "/amp/scan", { seconds: 20 }); showFound(); });
 $("pairPhone").onclick = () => act("Pairing window", () => call("POST", "/phones/pairing", { seconds: 120 }));

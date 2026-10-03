@@ -1,12 +1,16 @@
 #!/bin/sh
-# Build the release asset that install/bootstrap.sh fetches:
-#   dist/nowairplaying-<ver>-trixie-arm64.tar.gz and its .sha256
+# Build the release assets:
+#   dist/nowairplaying-<ver>-trixie-arm64.tar.gz and its .sha256, the release
+#     that install/bootstrap.sh fetches
+#   dist/nowairplaying-bootstrap-<ver>.sh and its .sha256, the tag's
+#     install/bootstrap.sh, so Home Assistant pins it from the release like
+#     the tarball (docs/INSTALL-STATE.md)
 #
 # The tarball is the tagged tree (git archive of v<ver>) plus the built trixie
 # packages in build/out/trixie/debs, under one top directory
 # nowairplaying-<ver>/. Run it as your normal user after build.sh, from a
-# clean tree whose HEAD is tagged v<VERSION>. Upload both files to the GitHub
-# release of that tag.
+# clean tree whose HEAD is tagged v<VERSION>. Upload all four files to the
+# GitHub release of that tag.
 set -eu
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -43,5 +47,9 @@ tar --sort=name --owner=0 --group=0 --numeric-owner \
     -C "$STAGE" -cf - "$TOP" | gzip -n -9 > "dist/$NAME.tar.gz"
 (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
 
-cat "dist/$NAME.tar.gz.sha256"
-echo "Upload both files in dist/ to the $TAG release."
+BOOT=nowairplaying-bootstrap-$VER.sh
+git show "$TAG:install/bootstrap.sh" > "dist/$BOOT"
+(cd dist && sha256sum "$BOOT" > "$BOOT.sha256")
+
+cat "dist/$NAME.tar.gz.sha256" "dist/$BOOT.sha256"
+echo "Upload the four files in dist/ for $VER to the $TAG release."

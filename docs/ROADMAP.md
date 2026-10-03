@@ -137,10 +137,14 @@ password and SSH public key on trixie. The node uses that Wi-Fi or Ethernet.
   - HA follows `install.json` and the log ([INSTALL-STATE](INSTALL-STATE.md)).
 - **After the install, everything goes through the setup API:** claim, amp pairing and
   verify. HA's claim carries the planted token.
-- **`v0.0.1`** (2026-09-30) is the first fetchable release. It covers the install path
-  only. Not built yet:
-  - speakerd and the setup service starting with no amp;
-  - the setup API and the claim token.
+- **`v0.0.1`** (2026-09-30) was the first fetchable release, the install path only.
+- **`v0.0.2`** (2026-10-03) adds the node API, the claim token, the two-account layout,
+  polkit updates and power, and Wi-Fi setup. speakerd and the API start with no amp.
+- **`0.0.3`** (never released on its own) tracks and restores the amp's audio link
+  (A2DP), which can drop while the amp stays connected.
+- **`0.0.4`** adds `POST /audio/restart`, re-claim with a planted token, the
+  bootstrap's downgrade guard, `installed` in `install.json`, and the bootstrap as a
+  release asset. It is released after the owner's playback test.
 
 ## 4. Releases
 
@@ -150,6 +154,7 @@ password and SSH public key on trixie. The node uses that Wi-Fi or Ethernet.
 - is a GitHub release `v<ver>`;
 - carries `nowairplaying-<ver>-trixie-arm64.tar.gz` (the tagged tree plus the built
   trixie packages) and its `.sha256`;
+- from `0.0.4`, also carries `nowairplaying-bootstrap-<ver>.sh` and its `.sha256`;
 - is built reproducibly by `build/release.sh`.
 
 **Home Assistant's integration pins one release and its hash per version.** A GPL

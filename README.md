@@ -10,7 +10,8 @@ its play/pause and skip buttons control the source.
 
 > **Status: under construction. Not ready for general use.**
 > - The installer works on stock Raspberry Pi OS Lite trixie.
-> - `v0.0.1` is a test release for the Home Assistant install path.
+> - The `v0.0.x` releases are test releases for the Home Assistant install path and the
+>   node API ([docs/SETUP-API.md](docs/SETUP-API.md)).
 > - Guided setup and phone Bluetooth are not built yet.
 >
 > See [docs/ROADMAP.md](docs/ROADMAP.md).

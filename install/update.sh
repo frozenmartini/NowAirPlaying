@@ -86,17 +86,10 @@ PHONES=$(sed -n 's/^PHONES=//p' "$ARGS_FILE" | head -1)
 [ -n "$USER_NAME" ] || fail bad_arguments "$ARGS_FILE has no USER= line"
 [ -n "$PHONES" ] || PHONES=onboard
 
-OLD_VERSION=
-if [ -f "$STATE_DIR/install.json" ] && [ "$(field "$STATE_DIR/install.json" state)" = done ]; then
-    OLD_VERSION=$(field "$STATE_DIR/install.json" version)
-fi
-# It becomes a path that root runs a script from (the rollback below), so it
-# gets the same strict check as the request's version. Anything else means
-# no downgrade check and no rollback, never a guess.
-if [ -n "$OLD_VERSION" ] && ! is_version "$OLD_VERSION"; then
-    say "install.json's version is not a release version: ignored (no rollback possible)"
-    OLD_VERSION=
-fi
+# It becomes a path that root runs a script from (the rollback below), so
+# installed_version only gives a strict release version. Nothing means no
+# downgrade check and no rollback, never a guess.
+OLD_VERSION=$(installed_version)
 
 if [ -n "$OLD_VERSION" ] && dpkg --compare-versions "$NEW_VERSION" lt "$OLD_VERSION"; then
     fail downgrade "requested $NEW_VERSION is older than the installed $OLD_VERSION"

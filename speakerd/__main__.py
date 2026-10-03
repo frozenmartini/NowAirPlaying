@@ -21,7 +21,7 @@ from .discovery import build_announce, build_discovery
 from .mqtt_link import EV_CONNECTED, EV_MESSAGE, MqttLink, NullMqttLink
 from .roster import Roster, load_state, update_state
 from .shairport import ShairportLink
-from .system import power
+from .system import power, run
 
 log = logging.getLogger("speakerd")
 
@@ -35,6 +35,19 @@ AMP_AUDIO_WAIT_S = 5
 # long as the amp stays connected without it. ConnectProfile never disconnects
 # the amp, and nothing can be playing in that state, so it disturbs nothing
 AMP_AUDIO_SLOW_RETRY_S = 60
+# POST /audio/restart: the audio account's own user units, restarted in their
+# dependency order (shairport-sync plays into PipeWire, WirePlumber links it)
+AUDIO_UNITS = ("pipewire.service", "wireplumber.service", "shairport-sync.service")
+# longer than systemd's own start timeouts (90 s a unit by default), so a hung
+# job is ended by systemd and systemctl returns by itself: killing the client
+# would leave the job queued, with the restart reported as over
+AUDIO_RESTART_TIMEOUT_S = 300
+# POST /audio/restart is open to the whole LAN: after one ends, refuse another
+# for this long, so nothing can keep the audio down by restarting it in a loop
+AUDIO_RESTART_COOLDOWN_S = 60
+# after the restart, before asking for the amp's audio link: WirePlumber
+# registers its Bluetooth endpoints with BlueZ just after it starts
+AUDIO_SETTLE_S = 3
 
 
 def _now_iso() -> str:
@@ -103,6 +116,10 @@ class App:
         self._amp_audio_task: asyncio.Task | None = None
         self._amp_connects = 0  # counts Connected=True edges: restarts the grace
         self._amp_edge = asyncio.Event()  # replaced on every amp edge, see _amp_edge_fire
+        # while an audio restart runs, it alone acts on the amp (_amp_gates_open)
+        self._audio_restarting = False
+        self._audio_restart_result: dict | None = None
+        self._audio_restart_ended: float | None = None  # loop time, for the cooldown
 
         subscriptions = [
             (cfg.topic("device", "+", "set"), 1),
@@ -206,6 +223,10 @@ class App:
         bt, ap = self._bt_streaming, self._airplay_active()
         return "both" if (bt and ap) else "bluetooth" if bt else "airplay" if ap else "idle"
 
+    @property
+    def audio_restart(self) -> dict:
+        return {"running": self._audio_restarting, "last_result": self._audio_restart_result}
+
     def last_result(self, slug: str) -> dict | None:
         return self._last_results.get(slug)
 
@@ -228,9 +249,28 @@ class App:
         self._set_auto_reconnect(enabled)
         self._changed()
 
+    def restart_audio(self) -> str | None:
+        """The API's POST /audio/restart: None once started, else why not
+        (one is running, or the cooldown). It runs on in the background;
+        node.audio_restart in the state reports it."""
+        if self._audio_restarting:
+            return "an audio restart is already running"
+        if self._audio_restart_ended is not None:
+            left = (self._audio_restart_ended + AUDIO_RESTART_COOLDOWN_S
+                    - asyncio.get_running_loop().time())
+            if left > 0:
+                return (f"an audio restart ended less than {AUDIO_RESTART_COOLDOWN_S} s ago: "
+                        f"try again in {int(left) + 1} s")
+        self._audio_restarting = True
+        self._spawn(self._restart_audio())
+        self._changed()
+        return None
+
     def amp_roster_changed(self) -> None:
         """The API paired or forgot the amp."""
         if self.roster.amp is None:
+            # an audio restart's own amp step stops by itself: needed() turns
+            # False without an amp
             for task in (self._amp_reconnect_task, self._amp_audio_task):
                 if task is not None:
                     task.cancel()
@@ -405,8 +445,10 @@ class App:
     # the amp itself fixing things first always wins.
 
     def _amp_gates_open(self) -> bool:
+        # an audio restart owns the amp until it ends, then re-arms these: two
+        # loops taking turns could Disconnect a link the other just brought up
         return (self.roster.amp is not None and self._auto_reconnect
-                and not self._amp_user_disconnected)
+                and not self._amp_user_disconnected and not self._audio_restarting)
 
     def _amp_needs_reconnect(self) -> bool:
         return self._amp_gates_open() and not self._amp_connected
@@ -545,6 +587,78 @@ class App:
                 return
             log.info("amp audio link: slow retry failed (%s)",
                      err if not ok else "no audio link after ConnectProfile")
+
+    # ------------------------------------------------- audio restart
+    #
+    # The repair for broken audio: restart PipeWire, WirePlumber and
+    # shairport-sync, then bring the amp's audio link back. They are this
+    # account's own user units, so this needs no privilege at all, and the
+    # API service, which runs as another account, never touches them.
+
+    async def _restart_audio(self) -> None:
+        ok, err = False, "interrupted"
+        try:
+            ok, err = await self._restart_audio_steps()
+        except asyncio.CancelledError:
+            err = "interrupted: speakerd stopped"
+            raise
+        except Exception as e:
+            log.exception("audio restart")
+            err = f"internal error: {e}"
+        finally:
+            if not ok:
+                log.error("audio restart: %s", err)
+            self._audio_restarting = False
+            self._audio_restart_ended = asyncio.get_running_loop().time()
+            self._audio_restart_result = {"ok": ok, "error": err, "at": _now_iso()}
+            self._changed()
+            # the automatic recoveries held off while this ran
+            self._maybe_auto_reconnect_amp()
+            self._maybe_restore_amp_audio()
+
+    async def _restart_audio_steps(self) -> tuple[bool, str | None]:
+        log.warning("restarting the audio stack: %s", ", ".join(AUDIO_UNITS))
+        rc, out = await run("systemctl", "--user", "restart", *AUDIO_UNITS,
+                            timeout=AUDIO_RESTART_TIMEOUT_S)
+        failed = None if rc == 0 else f"restart failed: {out or f'exit {rc}'}"
+        if failed is None:
+            log.info("audio stack restarted")
+        # even after a failure (say shairport-sync wouldn't start), PipeWire and
+        # WirePlumber may have restarted and taken the amp's audio link along
+        ok, err = await self._restore_amp_after_restart()
+        if failed is not None:
+            return False, failed if ok else f"{failed}; {err}"
+        return ok, err
+
+    async def _restore_amp_after_restart(self) -> tuple[bool, str | None]:
+        """The restart took the amp's audio link with it (WirePlumber's
+        endpoints go when it stops). Bring it back now, with no grace and
+        whatever the auto-reconnect switch says: someone asked for working
+        audio. A deliberate disconnect still wins. The automatic recoveries
+        hold off until the restart ends (_amp_gates_open)."""
+        if self.roster.amp is None:
+            return True, None
+        await asyncio.sleep(AUDIO_SETTLE_S)
+
+        def needed() -> bool:
+            return (self.roster.amp is not None and not self._amp_user_disconnected
+                    and not (self._amp_connected and self.amp_audio))
+
+        async def restore(attempt):
+            if not self._amp_connected:
+                return await self.engine.connect_device(AMP_SLUG)
+            if attempt == 1:
+                return await self.engine.connect_amp_audio()
+            return await self.engine.fix_metadata()
+
+        result = await self._amp_retry("audio_restart", needed, restore,
+                                       lambda: self._amp_connected and self.amp_audio,
+                                       AMP_AUDIO_WAIT_S, "no audio link after the restart")
+        if result is False:
+            last = self._last_results.get(AMP_SLUG) or {}
+            return False, f"the audio stack restarted, but the amp's audio link did not come " \
+                          f"back: {last.get('error')}"
+        return True, None
 
     def _set_auto_reconnect(self, enabled: bool) -> None:
         if enabled != self._auto_reconnect:

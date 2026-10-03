@@ -106,9 +106,11 @@ the network can publish a TXT record.
   `install.json` write once the certificate exists, so it's always the certificate the
   API serves. HA reads it over the same SSH session and pins it before its first API
   call. Nothing is trusted on first contact.
-- **Installed by hand,** then found by Home Assistant through zeroconf: there's no SSH
-  session to read the fingerprint from. HA pins the certificate it sees at `/claim`
-  (trust on first use) and checks it on every call after that.
+- **Installed by hand,** then found by Home Assistant through zeroconf: HA still logs in
+  over SSH, the same as for any other node, and reads `cert_sha256` from `install.json`
+  before its first HTTPS call. The zeroconf record only tells HA that the node exists.
+  With no SSH access there is no pin, and HA doesn't claim the node. There is no trust on
+  first use (confirmed by HA on kap#003, 2026-10-03).
 - **A changed certificate** (the files were deleted and a re-run made new ones): HA stops
   calling the node and raises a repair with a **Reconnect** button (agreed 2026-10-02).
   - Reconnect logs in over SSH with HA's key, against the pinned SSH host key, reads
@@ -131,20 +133,36 @@ the network can publish a TXT record.
     `~/.config/nowairplaying/claim-token` over SSH, as the login user with no `sudo`.
     - The file holds the lowercase hex SHA-256 of 32 random bytes. It is mode 0600.
     - **The install moves it** to `/var/lib/nowairplaying/claim/claim-token`, owned by
-      `nowairplaying-api`, mode 0600.
+      `nowairplaying-api`, mode 0600. From `0.0.4` a planted token replaces one already
+      there: a fresh plant always comes from the newest setup.
     - That directory is mode 2770, group `nowairplaying-api`. The install adds the
       login user (`--user`) to that group. From their next SSH login, they can plant a
-      fresh token there directly, still without `sudo`. Plant it **mode 0640**: the
-      directory makes its group `nowairplaying-api`, which must be able to read it.
+      fresh token there directly, still without `sudo`. This is supported and stays.
+    - **Plant it mode 0640, with group `nowairplaying-api`,** which must be able to
+      read it. The directory gives its group only to a file **created** in it. `mv`
+      keeps a file's own group, so a file written elsewhere (the home folder, `/tmp`)
+      and moved in keeps the login user's group, and the API can't read it. Write a
+      temporary file inside `claim/` and `mv -f` it over `claim-token`, or
+      `chgrp nowairplaying-api` it before the move.
     - **A planted file the API can't use locks the claim, it never opens it.** One it
       can't read, or that isn't 64 hex characters, makes `/claim` return
       `409 claim_token_invalid`, and `/info` still reports `"claim": "token"`.
     - `/claim` then needs `Authorization: Bearer <the 64-hex bytes>`.
     - The file is read on **every** `/claim` request, never once at startup. Whitespace
       around its contents is ignored.
-    - A successful claim deletes it.
+    - A successful claim deletes it, before anything is claimed.
     - `GET /info` reports `"claim": "token"` or `"open"`.
-  - **Otherwise the first claimer wins.** That covers a node installed by hand.
+  - **Otherwise the first claimer wins.** The node doesn't check who is asking. Home
+    Assistant only claims a node whose certificate it has already pinned over SSH (see
+    [Trust](#trust-the-pinned-certificate)).
+- **Re-claiming** (from `0.0.4`): on a claimed node, `/claim` with a planted token's
+  bearer replaces the claim and returns a new token. The old token stops working, and
+  event streams opened with it end.
+  - Planting needs an SSH login in group `nowairplaying-api`, the same proof of
+    ownership Reconnect relies on.
+  - It frees a node whose claim reply was lost (no one holds its token), and lets a
+    rebuilt Home Assistant take its node back.
+  - Without a planted token, a claimed node still answers `409 already_claimed`.
 - **The token** is 32 random bytes, returned once by `/claim`. The node stores only its
   SHA-256. It is sent as `Authorization: Bearer <token>`.
 
@@ -176,7 +194,8 @@ All paths are under `/api/v2`. Bodies are JSON. The **Auth** column:
 - **owner:** on an unclaimed node, anyone. On a claimed node, the token, over HTTPS only.
 - **token:** claimed nodes only, with the token, over HTTPS only. On an unclaimed node
   these return `403 claim_required`: updates and power are Home Assistant features.
-- **open:** anyone, even on a claimed node.
+- **open:** anyone, even on a claimed node: amp connect and disconnect, and the audio
+  restart. They change nothing in the configuration.
 
 A request that carries an `Authorization` header over HTTP is refused with
 `403 https_required`, and the node logs it. The token never needs to cross the
@@ -188,7 +207,7 @@ network in the clear.
 | `GET /verify` | none | health checks |
 | `GET /state` | owner | the full state, once |
 | `GET /events` | owner | the full state, then every change (SSE) |
-| `POST /claim` | none, unclaimed only, HTTPS only | lock the node to one Home Assistant |
+| `POST /claim` | none, HTTPS only. Unclaimed, or with a planted token | lock the node to one Home Assistant |
 | `POST /release` | token | undo the claim |
 | `POST /amp/scan` | owner | start a Bluetooth scan for the amp |
 | `GET /amp/found` | owner | devices seen by the scan |
@@ -198,6 +217,7 @@ network in the clear.
 | `POST /amp/reconnect` | owner | disconnect, wait, connect: restores the amp's track display ("fix metadata") |
 | `PUT /amp/auto-reconnect` | owner | `{"on": true}` or `{"on": false}` |
 | `POST /amp/forget` | owner | unpair the amp |
+| `POST /audio/restart` | open | from `0.0.4`: restart the audio stack and bring the amp's audio back |
 | `POST /phones/pairing` | owner | open or close the phone pairing window |
 | `POST /phones/{mac}/connect` | owner | connect a paired phone |
 | `POST /phones/{mac}/disconnect` | owner | disconnect a phone |
@@ -227,11 +247,11 @@ poll.
   "area": "Bathroom",
   "phones": "onboard",
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
-          "paired": true, "connected": true}
+          "paired": true, "connected": true, "audio": true}
 }
 ```
 
-`amp` is `null` before pairing. `claim` is `token` while a planted token waits and `open`
+`amp` is `null` before pairing. `amp.audio` is there from `0.0.4`, as in the state. `claim` is `token` while a planted token waits and `open`
 otherwise. **No response ever contains a password, a key or the token** (except
 `/claim`'s one-time reply).
 
@@ -241,8 +261,20 @@ otherwise. **No response ever contains a password, a key or the token** (except
 {"name": "Bathroom Speaker", "area": "Bathroom", "claimed_by": "homeassistant.local"}
 ```
 
-- `200` → `{"token": "…"}`. `409 already_claimed` if the node is claimed.
+- `200` → `{"token": "…"}`.
+- `409 already_claimed` if the node is claimed and no token is planted.
   `409 claim_token_invalid` if a planted token file is there but unusable.
+  `401 unauthorized` if a token is planted and the bearer doesn't match it.
+- On a claimed node with a planted token, it [re-claims](#ownership-unclaimed-and-claimed).
+- `area` and `claimed_by` are optional: each at most 255 characters, with no control
+  characters and no Unicode line or paragraph separators (`400 bad_request`
+  otherwise).
+- `name` is optional and follows the same rule as [`PUT /node/name`](#put-nodename):
+  1–40 characters, no quotes, backslashes, `/`, `&` or control characters. A bad name
+  is `400 bad_request` and nothing is claimed. The token checks come first, so a wrong
+  bearer is still `401`.
+- `502 failed` if the used planted token can't be deleted. Nothing is claimed then: a
+  plant left behind would let its holder re-claim the node at any time.
 - HTTPS only. Over HTTP it returns `403 https_required`.
 - The node id stays the MAC-derived `id`. `name` sets the display name (and the AirPlay
   name); `area` is only stored and returned for HA. So a later rename never re-keys
@@ -277,9 +309,10 @@ stream (`text/event-stream`):
 
 ```json
 {
-  "node": {"name": "Bathroom Speaker", "version": "0.0.2",
+  "node": {"name": "Bathroom Speaker", "version": "0.0.4",
            "update": {"state": "idle", "version": null, "phase_name": null,
-                      "reason": null, "message": null, "rolled_back": false}},
+                      "reason": null, "message": null, "rolled_back": false},
+           "audio_restart": {"running": false, "last_result": null}},
   "network": {"link": "wifi", "ssid": "Home", "signal": 71, "ip": "192.168.1.42"},
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
           "paired": true, "connected": true, "audio": true, "auto_reconnect": true,
@@ -311,6 +344,7 @@ stream (`text/event-stream`):
 | `phones.pairing` | `until` is when the window closes; `last_paired` is the MAC of the last phone paired in it |
 | `network.link` | `wifi` or `ethernet`. `ssid` and `signal` (0–100) are `null` on Ethernet |
 | `node.update` | progress of an update; see below |
+| `node.audio_restart` | from `0.0.4`: `running`, and `last_result` (`ok`, `error`, `at`) of the latest [audio restart](#post-audiorestart), `null` before the first |
 
 **No volume.** speakerd has no volume control. Volume follows the sender: the phone or
 Mac sets it, and it reaches the Kohler over AVRCP. The amp has no absolute volume, so a
@@ -359,6 +393,28 @@ level can't be set from outside. A relative step may come later.
   deliberate disconnect, or auto-reconnect off, leaves both alone.
 - **forget:** removes the pairing and clears the amp from the config. speakerd keeps
   running with no amp.
+
+### `POST /audio/restart`
+
+The repair for broken audio (from `0.0.4`). For Home Assistant, a "Restart audio"
+button; the setup page has one too.
+
+- `202` → `{"ok": true}`. It runs on in the background, and `node.audio_restart`
+  follows it.
+- `409 busy` while one is running, and for 60 seconds after one ends: it's open to
+  the whole network, so nothing can keep the audio down by restarting it in a loop.
+  `message` says how many seconds are left.
+- **What it does:**
+  1. Restarts PipeWire, WirePlumber and shairport-sync, in that order. AirPlay drops
+     for a few seconds, and a phone's Bluetooth audio pauses.
+  2. Brings the amp's audio link back, which the restart always takes down: the audio
+     link alone first, then a full reconnect, three attempts in all. If the amp
+     dropped, it connects it. This ignores the auto-reconnect switch, since someone
+     asked for working audio; a deliberate disconnect still wins.
+- `last_result.ok` is `false` with `error` when the restart failed or the amp's audio
+  link didn't come back. Sound is normally back within 10 to 30 seconds.
+- The services belong to the audio account, which restarts them itself. No privilege is
+  involved, and the API account never touches them.
 
 ### Phones
 
@@ -476,9 +532,9 @@ Every error is JSON: `{"error": "<code>", "message": "<human text>"}`.
 | 403 | `https_required` | a token was sent over HTTP, or `/claim` was called over HTTP |
 | 403 | `claim_required` | a **token** endpoint on an unclaimed node |
 | 404 | `not_found` | no such endpoint, no paired amp, or an unknown phone |
-| 409 | `already_claimed` | `/claim` on a claimed node |
+| 409 | `already_claimed` | `/claim` on a claimed node, with no token planted |
 | 409 | `claim_token_invalid` | `/claim` while a planted token file is unreadable or not 64 hex characters |
-| 409 | `busy` | a scan, pair or update is already running |
+| 409 | `busy` | a scan, pair, update or audio restart is already running, or an audio restart ended less than 60 s ago |
 | 409 | `downgrade` | `/node/update` to an older version |
 | 502 | `pair_failed`, `failed` | BlueZ or systemd refused, or speakerd isn't running. `message` carries the error |
 
@@ -510,7 +566,8 @@ system services act for **`nowairplaying-api` only**, on exactly these actions:
   `claim/` and `tls/` root never runs `chown` or `chmod`, which would follow a link; it
   only creates missing files, and `install` replaces a link rather than writing through
   it. The update unit refuses a `request.json` that is a link, and re-checks
-  `install.json`'s version (`N.N.N`) before it builds a rollback path from it.
+  the installed version in `install.json` (`N.N.N`) before it builds a rollback path
+  from it.
 - **The login user and anything the owner runs** get nothing new from the rules.
 - **OS updates aren't done from Home Assistant.** The install turns on Debian's
   `unattended-upgrades` for security updates. Our two packages are apt-held, so those
@@ -579,11 +636,12 @@ It calls the endpoints above with no token:
 1. **Status:** name, whether the amp is connected, and the verify checks as green or red.
 2. **Pair the amplifier:** "Put the amplifier in pairing mode, then press Scan", then a
    list with likely amps first. The user picks one, presses Pair, and sees the result.
-3. **Amplifier:** Connect, Disconnect, Reconnect and Forget buttons.
+3. **Amplifier:** Connect, Disconnect, Restart audio, Reconnect and Forget buttons. An
+   amp connected without its audio link shows "connected, but no audio link".
 4. **Phones:** "Let a phone pair (2 minutes)", the phone list, and Connect, Disconnect
    and Forget buttons.
-5. **When claimed:** "Managed by Home Assistant at `<host>`". Status and amp
-   Connect/Disconnect stay; every other control is hidden.
+5. **When claimed:** "Managed by Home Assistant at `<host>`". Status, amp
+   Connect/Disconnect and Restart audio stay; every other control is hidden.
 
 **Why the page is HTTP:** a node can only offer HTTPS with a self-signed certificate,
 and every phone and browser shows a full-screen warning for one. For a beginner's first

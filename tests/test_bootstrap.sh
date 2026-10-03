@@ -109,6 +109,27 @@ failcase "quote in message" bad_arguments --version 9.9.9 --url "file://$tgz" \
 failcase "no such user" bad_arguments --version 9.9.9 --url "file://$tgz" \
     --sha256 "$(sha "$tgz")" --user nosuchuser-nap --name X
 
+# --- 0.0.4: "installed" names the last release that finished, and the
+# bootstrap refuses to go back past it (the same rule as update.sh)
+check "status.sh: done sets installed, a later failure keeps it" \
+    '( VERSION=7.0.0 STARTED=x LOG="$T/log/install.log" LOG_OFFSET=0
+       . "$REPO/install/status.sh"
+       write_status done 6 verify 0 "" ""
+       VERSION=8.0.0; write_status failed 2 apt 1 install_failed "x"
+       [ "$(field installed)|$(field version)|$(installed_version)" = "7.0.0|8.0.0|7.0.0" ] )'
+printf '{"state": "done", "version": "10.0.0"}\n' > "$NAP_STATE_DIR/install.json"
+failcase "downgrade from an older file's done version" downgrade --version 9.9.9 \
+    --url "file://$tgz" --sha256 "$(sha "$tgz")" --user "$ME" --name X
+check "downgrade: installed is still 10.0.0" '[ "$(field installed)" = 10.0.0 ]'
+check "downgrade: nothing was fetched or unpacked" '[ ! -e "$NAP_PREFIX/9.9.9" ]'
+( VERSION=9.9.9 STARTED=x LOG="$T/log/install.log" LOG_OFFSET=0
+  . "$REPO/install/status.sh"; write_status done 6 verify 0 "" "" )
+if boot --version 9.9.9 --url "file://$tgz" --sha256 "$(sha "$tgz")" --user "$ME" --name X; then
+    ok "same version as installed: allowed, as a repair"
+else
+    bad "same version as installed: exit $?"; cat "$T/out"
+fi
+
 # --- status.sh: the installer's final state from its exit and its log
 (
     VERSION=1.0.0 STARTED=now LOG=$T/fin.log
@@ -312,6 +333,7 @@ write_request 4.0.0 "$(printf '0%.0s' $(seq 64))"
 run_update || true
 check "update.sh: a version older than the installed one -> downgrade, not install_failed" \
     '[ "$(ufield state)|$(ufield version)|$(ufield reason)" = "failed|4.0.0|downgrade" ]'
+check "update.sh: a refused downgrade keeps installed at 5.0.0" '[ "$(ufield installed)" = 5.0.0 ]'
 
 reset_update_state
 write_install_args "$ME" onboard
@@ -425,6 +447,8 @@ $(printf "a%.0s" $(seq 64))" )'
 # --- install.sh: put returns 1 for an unchanged file, so a bare call ends the
 # install silently under set -e (the first .156 run, 2026-10-03, at
 # 20auto-upgrades, which trixie's unattended-upgrades had already written)
+check "install.sh: every file install has -T (never writes into a linked directory)" \
+    '! grep -nE "(^|[;&|][[:space:]]*|^[[:space:]]+)install -m " "$REPO/install/install.sh" | grep -v "/opt/nowairplaying/speakerd/\$"'
 check "install.sh: every put is under if, or has || true" \
     '! grep -nE "^[[:space:]]*put " "$REPO/install/install.sh" | grep -v "|| true\$"'
 

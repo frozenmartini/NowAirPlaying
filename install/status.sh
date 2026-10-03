@@ -41,6 +41,20 @@ is_sha256() {
     [ ${#1} -eq 64 ]
 }
 
+# the release that last finished: install.json's "installed" (from 0.0.4),
+# or, in an older file, its version when the state is done. Nothing when
+# neither is there, or the value isn't a release version: it becomes a path
+# root runs a script from (install/update.sh's rollback).
+installed_version() {
+    iv_file=$STATE_DIR/install.json
+    [ -f "$iv_file" ] || return 0
+    iv=$(sed -n 's/.*"installed": "\([^"]*\)".*/\1/p' "$iv_file" | head -1)
+    if [ -z "$iv" ] && grep -q '"state": "done"' "$iv_file"; then
+        iv=$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$iv_file" | head -1)
+    fi
+    if is_version "$iv"; then printf '%s' "$iv"; fi
+}
+
 # the SHA-256 of the API certificate in DER form, lowercase hex, or nothing
 # if it isn't there yet. docs/SETUP-API.md "Trust: the pinned certificate".
 cert_sha256() {
@@ -58,11 +72,13 @@ cert_sha256() {
 # on a "done" write. A caller passes CERT_SHA256 explicitly only to override
 # that live value, which install/update.sh's rollback write does. ROLLED_BACK
 # is optional: empty means false, which is every call that predates it.
+# "installed" becomes VERSION on done and carries over on every other write.
 write_status() {
     mkdir -p "$STATE_DIR"
     chmod 755 "$STATE_DIR"
     if [ "$1" = installing ]; then finished=null; else finished=$(json_str "$(date -Is)"); fi
     cert=${7:-$(cert_sha256 2>/dev/null || true)}
+    if [ "$1" = done ]; then installed=$VERSION; else installed=$(installed_version); fi
     tmp=$STATE_DIR/.install.json.$$
     cat > "$tmp" <<EOF
 {"state": $(json_str "$1"), "version": $(json_str "$VERSION"),
@@ -70,7 +86,8 @@ write_status() {
  "started": $(json_str "$STARTED"), "finished": $finished, "exit": $(json_int "$4"),
  "reason": $(json_str "$5"), "message": $(json_str "$6"),
  "log": $(json_str "$LOG"), "log_offset": $(json_int "$LOG_OFFSET"),
- "cert_sha256": $(json_str "$cert"), "rolled_back": $(json_bool "${8:-}")}
+ "cert_sha256": $(json_str "$cert"), "rolled_back": $(json_bool "${8:-}"),
+ "installed": $(json_str "$installed")}
 EOF
     chmod 644 "$tmp"
     mv -f "$tmp" "$STATE_DIR/install.json"

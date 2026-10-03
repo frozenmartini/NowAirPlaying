@@ -25,7 +25,7 @@ UPDATE_UNIT = "nowairplaying-update.service"
 INSTALL_UNIT = "nowairplaying-install.service"
 POLKIT_RULES = "/usr/share/polkit-1/rules.d/50-nowairplaying.rules"
 HELD = ("nowairplaying-nqptp", "nowairplaying-shairport-sync")
-_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")  # no trailing newline
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 UNKNOWN_VERSION = "0.0.0"
 
@@ -105,8 +105,12 @@ class System:
 
     def installed_version(self) -> str:
         rec = self.install_record() or {}
-        v = rec.get("version")
-        if rec.get("state") == "done" and isinstance(v, str) and _VERSION_RE.match(v):
+        # "installed" (from 0.0.4) survives a failed or refused run after it;
+        # an older file only has the version of a run that ended done
+        v = rec.get("installed")
+        if not (isinstance(v, str) and _VERSION_RE.match(v)):
+            v = rec.get("version") if rec.get("state") == "done" else None
+        if isinstance(v, str) and _VERSION_RE.match(v):
             return v
         # never recorded (an install from before install.json): unknown, which
         # orders below every release, so no update is ever refused as a downgrade

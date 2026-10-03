@@ -196,7 +196,7 @@ put() {
         return 1
     fi
     # die, not set -e: set -e is off inside "if put" and "put || true"
-    install -m "$3" -o "$4" -g "$(id -gn "$4")" "$1" "$2" || die "could not write $2"
+    install -T -m "$3" -o "$4" -g "$(id -gn "$4")" "$1" "$2" || die "could not write $2"
     info "wrote $2"
 }
 
@@ -657,20 +657,28 @@ ensure_dirs() {
 
 # a claim token Home Assistant planted at --user's home, over SSH with no
 # sudo, before the install (docs/SETUP-API.md "Ownership"). Never printed.
-# Owned by nowairplaying-api, the only account that reads it. An existing
-# one is left exactly as it is (see ensure_dirs: no root chown in there); one
-# the API can't read locks /claim rather than opening it.
+# Owned by nowairplaying-api, the only account that reads it. A fresh plant
+# always comes from the newest setup, so it replaces one already in claim/.
+# That one is removed, never written through (see ensure_dirs: no root chown
+# in there), and install writes a new file. One the API can't read locks
+# /claim rather than opening it.
 migrate_claim_token() {
     src=$USER_HOME/.config/nowairplaying/claim-token
     dest=$STATE_DIR/claim/claim-token
     [ -f "$src" ] || return 0
     # root copies it: never follow a link to some other file
     [ ! -L "$src" ] || { rm -f "$src"; info "ignored a claim-token that was a symlink"; return 0; }
-    if [ -e "$dest" ] || [ -L "$dest" ]; then
+    # rm -f can't remove a directory, and set -e would end the install there;
+    # the API can't read a directory either, so the claim stays locked
+    if [ -d "$dest" ] && [ ! -L "$dest" ]; then
         rm -f "$src"
+        info "claim/claim-token is a directory: left alone, the claim stays locked"
         return 0
     fi
-    install -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$src" "$dest"
+    rm -f "$dest"
+    # -T: a link to a directory planted after the rm is replaced, never
+    # written into (without it, install puts the file inside the directory)
+    install -T -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$src" "$dest"
     rm -f "$src"
     info "moved a planted claim token into place"
 }
@@ -679,7 +687,7 @@ migrate_claim_token() {
 # updates (docs/SETUP-API.md "Trust: the pinned certificate"). Owned by
 # nowairplaying-api, which serves it. A re-run keeps a pair of real files as
 # they are, without touching them (see ensure_dirs), and replaces a missing
-# one or a link (install(1) replaces a link rather than writing through it).
+# one or a link (install -T replaces a link rather than writing through it).
 # CERT_CHANGED is only set when a certificate is actually generated, so
 # install.sh only restarts the API service on a real change.
 ensure_tls() {
@@ -693,8 +701,9 @@ ensure_tls() {
           -subj "/CN=nowairplaying" -addext "subjectAltName=DNS:$hn.local" \
           -keyout "$TMP/key.pem" -out "$TMP/cert.pem" ) 2> "$TMP/openssl.err" \
         || die "could not generate the TLS certificate: $(tail -1 "$TMP/openssl.err")"
-    install -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/key.pem" "$k"
-    install -m 0644 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/cert.pem" "$c"
+    # -T, as in migrate_claim_token: tls/ is the API account's
+    install -T -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/key.pem" "$k"
+    install -T -m 0644 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/cert.pem" "$c"
     info "generated a self-signed TLS certificate for $hn.local (valid 100 years)"
     CERT_CHANGED=1
 }
@@ -825,6 +834,12 @@ bluetoothd_is_ours() {
 FAILS=0
 ok()   { printf '   ok    %s\n' "$*"; }
 bad()  { printf '   FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
+# speakerd is a user unit of $NAP_USER. "journalctl --user" would read the
+# caller's own journal, and --user-unit adds the caller's _UID, so name the
+# account's uid instead.
+speakerd_log_hint() {
+    printf 'journalctl _UID=%s _SYSTEMD_USER_UNIT=speakerd.service' "${NAP_UID:-$(id -u "$NAP_USER")}"
+}
 
 # wait up to $1 seconds for a command to succeed
 within() {
@@ -926,7 +941,7 @@ verify() {
     if user_ctl is-active --quiet speakerd.service; then
         ok "speakerd is running"
     else
-        bad "speakerd is not running: journalctl --user -u speakerd"
+        bad "speakerd is not running: $(speakerd_log_hint)"
     fi
 
     if systemctl is-active --quiet nowairplaying-api.service; then
@@ -969,7 +984,7 @@ verify() {
                     --since @$since -q --no-pager | grep -q 'amp player registered'"; then
                 ok "one player on the amp's adapter: speakerd's /org/speakerd/player"
             else
-                bad "speakerd has not registered its player: journalctl --user -u speakerd"
+                bad "speakerd has not registered its player: $(speakerd_log_hint)"
             fi
         fi
     fi

@@ -12,7 +12,8 @@ Auth levels, per route:
   none    anyone, over HTTP or HTTPS
   owner   unclaimed: anyone; claimed: the token, over HTTPS only
   token   claimed only, with the token, over HTTPS only
-  open    anyone, even on a claimed node (amp connect/disconnect)
+  open    anyone, even on a claimed node (amp connect/disconnect, the
+          audio restart)
 """
 from __future__ import annotations
 
@@ -77,6 +78,7 @@ class Api:
             ("POST", "/amp/reconnect", OWNER, self.amp_reconnect),
             ("PUT", "/amp/auto-reconnect", OWNER, self.amp_auto_reconnect),
             ("POST", "/amp/forget", OWNER, self.amp_forget),
+            ("POST", "/audio/restart", OPEN, self.audio_restart),
             ("POST", "/phones/pairing", OWNER, self.phones_pairing),
             ("POST", "/phones/{mac}/connect", OWNER, self.phone_connect),
             ("POST", "/phones/{mac}/disconnect", OWNER, self.phone_disconnect),
@@ -113,6 +115,13 @@ class Api:
                 raise ApiError(401, "unauthorized", "this node is claimed: use HTTPS and its token")
             if not self.node.claims.token_ok(_bearer(request)):
                 raise ApiError(401, "unauthorized", "token missing or wrong")
+
+    def _allowed(self, request: web.Request, level: str) -> bool:
+        try:
+            self._authorize(request, level)
+        except ApiError:
+            return False
+        return True
 
     @web.middleware
     async def _errors(self, request: web.Request, handler):
@@ -196,6 +205,10 @@ class Api:
         await resp.prepare(request)
         q = hub.subscribe()
         try:
+            # a release or re-claim while the headers went out closed every
+            # stream but missed this one, which wasn't subscribed yet
+            if not self._allowed(request, OWNER):
+                return resp
             seq, state = hub.snapshot()
             await resp.write(_sse(seq, "state", state))
             while True:
@@ -257,6 +270,9 @@ class Api:
 
     async def amp_forget(self, request):
         return await self._audio("amp.forget")
+
+    async def audio_restart(self, request):
+        return await self._audio("audio.restart", status=202)
 
     async def phones_pairing(self, request):
         return await self._audio("phones.pairing", await self._body(request))

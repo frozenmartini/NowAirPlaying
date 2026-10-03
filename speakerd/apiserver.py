@@ -25,6 +25,7 @@ import secrets
 import signal
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 
 from .control import AudioClient
@@ -44,6 +45,7 @@ UPDATE_POLL_S = 2
 UPDATE_PENDING_S = 15  # how long a just-started update may take to show as active
 POWER_DELAY_S = 2
 SSE_QUEUE = 256
+NO_AUDIO_RESTART = {"running": False, "last_result": None}
 NO_PHONES = {"pairing": {"open": False, "until": None, "last_paired": None}, "devices": []}
 IDLE_PLAYING = {"airplay": {"status": "idle", "title": None, "artist": None, "album": None,
                             "client": None},
@@ -74,6 +76,12 @@ class ApiConfig:
 
 
 # ----------------------------------------------------------------- the claim
+
+def _has_control(text: str) -> bool:
+    """C0 and C1 controls, DEL, and the Unicode line and paragraph
+    separators: anything that can break a line where these get shown."""
+    return any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in text)
+
 
 def hash_ok(token: str | None, expected_hex: str) -> bool:
     """Bearer tokens are the hex of 32 raw bytes; stored hashes are the
@@ -140,15 +148,19 @@ class ClaimStore:
         return self.claimed and hash_ok(token, self._data["token_sha256"])
 
     def claim(self, claimed_by: str | None, area: str | None) -> str:
-        raw = secrets.token_bytes(32)
-        self._write({"token_sha256": hashlib.sha256(raw).hexdigest(),
-                     "claimed_by": claimed_by, "area": area, "claimed_at": now_iso()})
+        # the plant goes first: one left behind would be a standing key that
+        # re-claims the node at any time, so no claim without removing it
         try:
             os.remove(self._planted)
         except FileNotFoundError:
             pass
         except OSError as e:
-            log.warning("could not delete the used claim-token: %s", e)
+            log.error("could not delete the used claim-token: %s", e)
+            raise ApiError(502, "failed", "could not delete the used claim token; "
+                           "nothing was claimed")
+        raw = secrets.token_bytes(32)
+        self._write({"token_sha256": hashlib.sha256(raw).hexdigest(),
+                     "claimed_by": claimed_by, "area": area, "claimed_at": now_iso()})
         return raw.hex()
 
     def release(self) -> None:
@@ -320,7 +332,8 @@ class ApiNode:
     def build_state(self) -> dict:
         a = self.audio
         return {
-            "node": {"name": self.name, "version": self.version, "update": dict(self._update)},
+            "node": {"name": self.name, "version": self.version, "update": dict(self._update),
+                     "audio_restart": a.get("audio_restart") or NO_AUDIO_RESTART},
             "network": dict(self._network),
             "amp": a.get("amp"),
             "phones": a.get("phones") or NO_PHONES,
@@ -348,7 +361,8 @@ class ApiNode:
             "area": self.claims.area,
             "phones": self.phones_setting,
             "amp": None if amp is None else {k: amp[k] for k in
-                                             ("mac", "name", "paired", "connected")},
+                                             ("mac", "name", "paired", "connected", "audio")
+                                             if k in amp},
         }
 
     @property
@@ -387,9 +401,15 @@ class ApiNode:
     # ------------------------------------------------------------- claim
 
     async def claim(self, bearer: str | None, body: dict) -> dict:
-        if self.claims.claimed:
-            raise ApiError(409, "already_claimed", "the node is already claimed")
+        """The first claim, or a re-claim: on a claimed node, a matching
+        planted token replaces the claim. Planting one needs an SSH login in
+        group nowairplaying-api, the same proof of ownership Reconnect relies
+        on. It frees a node whose claim answer was lost, and lets a rebuilt
+        Home Assistant take its node back (docs/SETUP-API.md)."""
         planted = self.claims.planted_hash()
+        reclaim = self.claims.claimed
+        if reclaim and planted is None:
+            raise ApiError(409, "already_claimed", "the node is already claimed")
         if planted == INVALID_PLANT:
             raise ApiError(409, "claim_token_invalid",
                            "the planted claim token can't be read: it must be 64 hex characters, "
@@ -400,10 +420,18 @@ class ApiNode:
         if name is not None:
             name = valid_name(name)
         for k, v in (("area", area), ("claimed_by", claimed_by)):
-            if v is not None and (not isinstance(v, str) or len(v) > 255):
-                raise ApiError(400, "bad_request", f"{k}: a string of at most 255 characters")
+            if v is not None and (not isinstance(v, str) or len(v) > 255
+                                  or _has_control(v)):
+                raise ApiError(400, "bad_request",
+                               f"{k}: at most 255 characters, no control characters")
+        previous = self.claims.claimed_by
         token = self.claims.claim(claimed_by, area)
-        log.warning("claimed by %s", claimed_by or "an unnamed client")
+        if reclaim:
+            log.warning("re-claimed with a planted token by %s, replacing %s",
+                        claimed_by or "an unnamed client", previous or "an unnamed client")
+            self.hub.close_all()  # streams opened under the old token end here
+        else:
+            log.warning("claimed by %s", claimed_by or "an unnamed client")
         calls = [("mqtt.discovery", {"enabled": False})]
         if name and name != self.name:
             calls.insert(0, ("node.rename", {"name": name}))

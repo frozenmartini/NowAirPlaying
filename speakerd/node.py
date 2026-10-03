@@ -5,7 +5,7 @@ grants. The API service (apiserver.py, account `nowairplaying-api`) owns the
 claim, HTTPS, zeroconf, updates and power, and reaches this over the local
 control socket (control.py). Everything here is Bluetooth, AirPlay and the
 node name: the pairing window and agent policy, scanning and pairing the amp,
-phones, media keys, and renaming.
+phones, media keys, renaming, and restarting the audio stack.
 
 The state object and every rule are docs/SETUP-API.md's.
 """
@@ -100,6 +100,11 @@ class AudioNode:
             if not isinstance(on, bool):
                 raise ApiError(400, "bad_request", "on: true or false")
             self.app.set_auto_reconnect(on)
+            return True
+        if method == "audio.restart":
+            refused = self.app.restart_audio()
+            if refused:
+                raise ApiError(409, "busy", refused)
             return True
         if method == "phones.pairing":
             await self.set_pairing(p)
@@ -206,6 +211,7 @@ class AudioNode:
                                    "until": self._pairing_until_iso,
                                    "last_paired": self._last_paired},
                        "devices": phones},
+            "audio_restart": app.audio_restart,
             "source": app.source,
             "bluetooth_streaming": bool(app.bt_streaming),
             "now_playing": {"airplay": app.airplay.now_playing(),

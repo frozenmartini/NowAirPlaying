@@ -160,7 +160,8 @@ shairport_conf = "{self.shairport_conf}"
         await self.control.stop()
         self.node.stop()
 
-    async def wait(self, cond, timeout=5):
+    # Generous on purpose: a loaded Pi once missed 5 s. A pass returns early.
+    async def wait(self, cond, timeout=15):
         loop = asyncio.get_running_loop()
         end = loop.time() + timeout
         while not cond():
@@ -433,7 +434,7 @@ async def test_speakerd_away(tmp):
         # it comes back on its own
         rig.control = ControlServer(rig.node, rig.sock)
         await rig.control.start()
-        await rig.wait(lambda: rig.api_node.audio.get("adapter_mac") == ADAPTER, timeout=8)
+        await rig.wait(lambda: rig.api_node.audio.get("adapter_mac") == ADAPTER)
         st, info = await c.req("GET", "/info")
         assert info["mac"] == ADAPTER, info
     await with_rig(tmp, body)
@@ -753,6 +754,222 @@ async def test_amp_audio_restore(tmp):
     print("amp_audio_restore: PASS")
 
 
+async def test_v004(tmp):
+    """0.0.4: re-claim with a planted token, claimed_by limits, the installed
+    version, and POST /audio/restart."""
+    log = os.path.join(tmp, "systemctl.log")
+    os.environ["FAKE_SYSTEMCTL_LOG"] = log
+
+    async def body(rig, c):
+        import dataclasses
+        app, eng = rig.app, rig.app.engine
+
+        # claimed_by and area: at most 255 characters, no control characters
+        for bad in ({"claimed_by": "ha\nevil"}, {"area": "x\x7f"}, {"claimed_by": "h" * 256},
+                    {"claimed_by": "ha\u0085x"}, {"area": "a\u2028b"}):
+            st, err = await c.req("POST", "/claim", bad, token=None)
+            assert st == 400 and err["error"] == "bad_request", (bad, err)
+        await c.claim()
+        old = c.token
+
+        # re-claim: refused without a planted token, or with the wrong bearer
+        st, err = await c.req("POST", "/claim", {}, token=None)
+        assert st == 409 and err["error"] == "already_claimed", err
+        bearer, h = raw_and_hash()
+        os.makedirs(rig.cfg.claim_dir, exist_ok=True)
+        planted = os.path.join(rig.cfg.claim_dir, "claim-token")
+        with open(planted, "w") as f:
+            f.write(h)
+        st, err = await c.req("POST", "/claim", {}, token="cd" * 32)
+        assert st == 401 and err["error"] == "unauthorized", err
+        # review 4: a plant that can't be deleted is never left as a standing key
+        os.chmod(rig.cfg.claim_dir, 0o500)
+        try:
+            st, err = await c.req("POST", "/claim", {}, token=bearer)
+            assert st == 502 and err["error"] == "failed", err
+        finally:
+            os.chmod(rig.cfg.claim_dir, 0o700)
+        st, _ = await c.req("GET", "/state", token=old)
+        assert st == 200, "a failed re-claim must leave the old claim in place"
+        # a stream opened under the old token ends at the re-claim
+        url = f"https://127.0.0.1:{rig.cfg.https_port}/api/v2/events"
+        async with c.s.get(url, headers={"Authorization": f"Bearer {old}"}, ssl=False) as r:
+            await r.content.readuntil(b"\n\n")  # the first state event
+            st, res = await c.req("POST", "/claim", {"claimed_by": "rebuilt-ha"}, token=bearer)
+            assert st == 200 and res["token"] != old, res
+            await asyncio.wait_for(r.content.read(), 2)  # ends, rather than pinging on
+        assert not os.path.exists(planted), "a used planted token must be deleted"
+        st, err = await c.req("GET", "/state", token=old)
+        assert st == 401, err
+        c.token = res["token"]
+        st, info = await c.req("GET", "/info")
+        assert info["state"] == "claimed" and info["claimed_by"] == "rebuilt-ha", info
+
+        # the installed version survives a failed or refused run after it
+        sysm = rig.api_node.system
+        for rec, want in (({"state": "failed", "version": "0.0.9", "installed": "0.0.3"}, "0.0.3"),
+                          ({"state": "done", "version": "0.0.4", "installed": None}, "0.0.4"),
+                          ({"state": "failed", "version": "0.0.4", "installed": "0.0.3\n"},
+                           "0.0.0")):
+            with open(rig.cfg.install_json, "w") as f:
+                json.dump(rec, f)
+            assert sysm.installed_version() == want, (rec, sysm.installed_version())
+
+        # POST /audio/restart: open, even on a claimed node
+        saved = speakerd_main.AUDIO_SETTLE_S, speakerd_main.AMP_AUDIO_WAIT_S
+        saved_grace = speakerd_main.AMP_AUDIO_GRACE_S
+        saved_cooldown = speakerd_main.AUDIO_RESTART_COOLDOWN_S
+        speakerd_main.AUDIO_RESTART_COOLDOWN_S = 0
+        speakerd_main.AUDIO_SETTLE_S, speakerd_main.AMP_AUDIO_WAIT_S = 0.3, 0.2
+        app.cfg = dataclasses.replace(app.cfg, amp_reconnect_retry_delay_s=0.01)
+        dev_path = eng.device_path(AMP)
+        fd = dev_path + "/sep1/fd0"
+
+        def transport(up):
+            if up:
+                eng._on_interfaces_added(fd, {"org.bluez.MediaTransport1":
+                                              {"State": Variant("s", "idle")}})
+            else:
+                eng._on_interfaces_removed(fd, ["org.bluez.MediaTransport1"])
+
+        def connected(on):
+            eng._dev_paths[AMP] = {dev_path: on}
+            eng._publish_device(AMP)
+
+        fail_profile = {"n": 0}  # this many ConnectProfile calls fail first
+
+        async def connect_amp_audio():
+            rig.calls.append(("ConnectProfile", "amp"))
+            if fail_profile["n"] > 0:
+                fail_profile["n"] -= 1
+                return False, "org.bluez.Error.Failed"
+            transport(True)
+            return True, None
+
+        async def fix_metadata():
+            rig.calls.append(("fix_metadata", "amp"))
+            transport(True)
+            return True, None
+
+        async def connect_device(slug):
+            rig.calls.append(("Connect", slug))
+            connected(True)
+            transport(True)
+            return True, None
+
+        eng.connect_amp_audio = connect_amp_audio
+        eng.connect_device = connect_device
+        eng.fix_metadata = fix_metadata
+
+        async def restart():
+            st, res = await c.req("POST", "/audio/restart", token=None)
+            assert st == 202, res
+            await rig.wait(lambda: not app.audio_restart["running"])
+            await rig.wait(lambda: rig.api_node.build_state()["node"]["audio_restart"]
+                           == app.audio_restart)
+            return app.audio_restart["last_result"]
+
+        try:
+            rig.node.roster.set_amp(AMP, "Amp")
+            rig.add_device(AMP, "Amp", paired=True, connected=True)
+            app.set_auto_reconnect(False)  # only the restart may act here
+            connected(True)
+            transport(False)  # what the restart does to the audio link
+            rig.calls.clear()
+            res = await restart()
+            assert res["ok"] and res["error"] is None, res
+            assert app.amp_audio and rig.calls == [("ConnectProfile", "amp")], rig.calls
+            with open(log) as f:
+                assert ("--user restart pipewire.service wireplumber.service "
+                        "shairport-sync.service") in f.read()
+            st, info = await c.req("GET", "/info")
+            assert info["amp"]["audio"] is True, info
+
+            # one at a time
+            transport(False)
+            st, res = await c.req("POST", "/audio/restart", token=None)
+            assert st == 202, res
+            st, err = await c.req("POST", "/audio/restart", token=None)
+            assert st == 409 and err["error"] == "busy", err
+            await rig.wait(lambda: not app.audio_restart["running"])
+
+            # a 60 s cooldown after one ends (shortened here)
+            transport(False)
+            await restart()
+            speakerd_main.AUDIO_RESTART_COOLDOWN_S = 0.5  # counts from the end just now
+            st, err = await c.req("POST", "/audio/restart", token=None)
+            assert st == 409 and err["error"] == "busy" and "try again" in err["message"], err
+            await asyncio.sleep(0.6)
+            transport(False)
+            assert (await restart())["ok"]
+            speakerd_main.AUDIO_RESTART_COOLDOWN_S = 0
+
+            # the amp dropped along with it: connected again
+            transport(False)
+            connected(False)
+            rig.calls.clear()
+            res = await restart()
+            assert res["ok"] and rig.calls == [("Connect", "amp")], rig.calls
+
+            # a deliberate disconnect still wins
+            await app.amp_command("disconnect")
+            transport(False)
+            connected(False)
+            rig.calls.clear()
+            res = await restart()
+            assert res["ok"] and rig.calls == [], rig.calls
+
+            # review 1: with auto-reconnect on, the automatic restore holds off
+            # while the restart runs, so only one loop acts on the amp
+            await app.amp_command("connect")
+            transport(True)
+            speakerd_main.AMP_AUDIO_GRACE_S = 0.05
+            app.set_auto_reconnect(True)
+            fail_profile["n"] = 1
+            transport(False)
+            rig.calls.clear()
+            res = await restart()
+            assert res["ok"], res
+            assert rig.calls == [("ConnectProfile", "amp"), ("fix_metadata", "amp")], rig.calls
+            # and it re-arms afterwards
+            rig.calls.clear()
+            transport(False)
+            await rig.wait(lambda: app.amp_audio)
+            assert rig.calls == [("ConnectProfile", "amp")], rig.calls
+            app.set_auto_reconnect(False)
+
+            # review 2: systemctl refused (shairport-sync wouldn't start), but the
+            # amp's audio link is still brought back
+            os.environ["FAKE_SYSTEMCTL_FAIL"] = "1"
+            transport(False)
+            rig.calls.clear()
+            res = await restart()
+            assert not res["ok"] and res["error"].startswith("restart failed"), res
+            assert app.amp_audio and rig.calls == [("ConnectProfile", "amp")], rig.calls
+            os.environ.pop("FAKE_SYSTEMCTL_FAIL")
+
+            # review 6: an unexpected error still ends the run with a result
+            async def boom():
+                raise RuntimeError("boom")
+            eng.connect_amp_audio = boom
+            transport(False)
+            res = await restart()
+            assert not res["ok"] and "internal error: boom" in res["error"], res
+            assert not app.audio_restart["running"]
+            st, state = await c.req("GET", "/state")
+            assert state["node"]["audio_restart"]["running"] is False, state["node"]
+        finally:
+            os.environ.pop("FAKE_SYSTEMCTL_FAIL", None)
+            speakerd_main.AUDIO_SETTLE_S, speakerd_main.AMP_AUDIO_WAIT_S = saved
+            speakerd_main.AMP_AUDIO_GRACE_S = saved_grace
+            speakerd_main.AUDIO_RESTART_COOLDOWN_S = saved_cooldown
+    try:
+        await with_rig(tmp, body)
+    finally:
+        os.environ["FAKE_SYSTEMCTL_LOG"] = os.devnull
+    print("v004: PASS")
+
+
 async def test_reset_request(tmp):
     rig = Rig(tmp)
     node = rig.api_node
@@ -815,7 +1032,7 @@ async def main():
         for test in (test_unclaimed_and_https_rules, test_planted_claim, test_claimed_auth,
                      test_sse, test_phones_and_pairing, test_speakerd_away, test_verify_merge,
                      test_agent_rejects, test_update, test_review_fixes,
-                     test_amp_audio_restore, test_reset_request,
+                     test_amp_audio_restore, test_v004, test_reset_request,
                      test_control_protocol, test_wifi_input):
             with tempfile.TemporaryDirectory() as tmp:
                 await test(tmp)
