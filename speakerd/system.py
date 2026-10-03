@@ -33,10 +33,10 @@ UNKNOWN_VERSION = "0.0.0"
 CHECK_ORDER = ("bluez_version", "pipewire_version", "wireplumber_version", "packages_held",
                "shairport_airplay2", "shairport_dbus", "no_mpris", "nqptp_active", "mdns",
                "polkit_rules", "speakerd_running", "amp_paired", "amp_connected",
-               "amp_player", "mqtt_connected")
+               "amp_audio", "amp_player", "mqtt_connected")
 SESSION_CHECKS = ("pipewire_version", "wireplumber_version", "shairport_airplay2",
                   "shairport_dbus", "no_mpris", "speakerd_running", "amp_paired",
-                  "amp_connected", "amp_player")
+                  "amp_connected", "amp_audio", "amp_player")
 
 
 async def run(*argv: str, timeout: float = 20) -> tuple[int, str]:
@@ -230,7 +230,7 @@ def session_unavailable(reason: str) -> list[dict]:
 
 async def session_checks(live: dict) -> list[dict]:
     """speakerd's side. `live` carries what speakerd itself knows:
-    shairport_present, amp_configured, amp_paired, amp_connected, amp_player,
+    shairport_present, amp_configured, amp_paired, amp_connected, amp_audio, amp_player,
     mqtt_enabled, mqtt_connected."""
     out = list(await asyncio.gather(_pipewire_version(), _wireplumber_version(),
                                     _shairport_airplay2(), _no_mpris()))
@@ -243,6 +243,10 @@ async def session_checks(live: dict) -> list[dict]:
                      else "not paired" if live.get("amp_configured") else "no amp configured"))
     out.append(check("amp_connected", live.get("amp_connected", False),
                      "connected" if live.get("amp_connected") else "not connected"))
+    out.append(check("amp_audio", live.get("amp_audio", False),
+                     "A2DP audio link up" if live.get("amp_audio")
+                     else "connected, but no audio link: AirPlay has nowhere to play"
+                     if live.get("amp_connected") else "not connected"))
     out.append(check("amp_player", live.get("amp_player", False),
                      "speakerd's player is registered" if live.get("amp_player")
                      else "no player registered on the amp's adapter"))

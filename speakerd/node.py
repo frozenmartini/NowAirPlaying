@@ -191,6 +191,7 @@ class AudioNode:
             amp_state = {"mac": amp.mac, "name": amp.name,
                          "paired": bool(dev.get("paired")),
                          "connected": bool(app.amp_connected),
+                         "audio": bool(app.amp_audio),
                          "auto_reconnect": bool(app.auto_reconnect),
                          "last_result": app.last_result("amp")}
         phones = [{"mac": d["mac"], "name": d["name"], "connected": d["connected"],
@@ -220,6 +221,7 @@ class AudioNode:
             "amp_configured": amp is not None,
             "amp_paired": bool(dev and dev["paired"] and dev["trusted"]),
             "amp_connected": bool(app.amp_connected),
+            "amp_audio": bool(app.amp_audio),
             "amp_player": bool(app.amp_export and app.amp_export.registered),
             "mqtt_enabled": self.cfg.mqtt_enabled,
             "mqtt_connected": bool(getattr(app.mqtt, "connected", False)),

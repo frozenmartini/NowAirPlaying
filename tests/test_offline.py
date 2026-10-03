@@ -64,6 +64,7 @@ async def test_auto_reconnect_policy(tmp):
     app = make_app(tmp)
     calls = []
     class FakeEngine:
+        amp_audio = True  # the audio link isn't under test here
         async def connect_device(self, slug):
             calls.append(slug)
             app._amp_connected = True  # simulate the connect succeeding
@@ -165,6 +166,7 @@ async def test_gate_off_under_lock(tmp):
     app = make_app(tmp)
     calls = []
     class FakeEngine:
+        amp_audio = True  # the audio link isn't under test here
         async def connect_device(self, slug):
             calls.append(slug); app._amp_connected = True; return True, None
     app.engine = FakeEngine()
@@ -188,6 +190,7 @@ async def test_user_off_survives_concurrent_connect(tmp):
     app = make_app(tmp)
     calls = []
     class FakeEngine:
+        amp_audio = True  # the audio link isn't under test here
         async def connect_device(self, slug):
             calls.append(("connect", slug)); app._amp_connected = True; return True, None
         async def disconnect_device(self, slug):
@@ -212,6 +215,7 @@ async def test_reeval_after_failed_op(tmp):
     app = make_app(tmp)
     calls = []
     class FakeEngine:
+        amp_audio = True  # the audio link isn't under test here
         async def fix_metadata(self):
             return False, "recipe failed"
         async def connect_device(self, slug):

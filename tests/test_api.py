@@ -12,6 +12,9 @@ import aiohttp
 from dbus_next import DBusError
 from dbus_next.service import ServiceInterface
 
+from dbus_next import Variant
+
+import speakerd.__main__ as speakerd_main
 from speakerd import config as config_mod
 from speakerd.__main__ import App
 from speakerd.agent import PairingAgent
@@ -609,6 +612,147 @@ async def test_review_fixes(tmp):
     print("review_fixes: PASS")
 
 
+async def test_amp_audio_restore(tmp):
+    """First .156 run: a WirePlumber restart dropped the amp's A2DP transport
+    while Device1 stayed connected, and nothing brought the audio back. Plus
+    the review of that fix (workspace/docs/nowairplaying-amp-audio-review.md)."""
+    async def body(rig, c):
+        import dataclasses
+        app, eng = rig.app, rig.app.engine
+        consts = ("AMP_AUDIO_GRACE_S", "AMP_AUDIO_WAIT_S", "AMP_AUDIO_SLOW_RETRY_S")
+        saved = {k: getattr(speakerd_main, k) for k in consts}
+        speakerd_main.AMP_AUDIO_GRACE_S = 0.05
+        speakerd_main.AMP_AUDIO_WAIT_S = 0.2
+        speakerd_main.AMP_AUDIO_SLOW_RETRY_S = 0.1
+        app.cfg = dataclasses.replace(app.cfg, amp_reconnect_retry_delay_s=0.01)
+        dev_path = eng.device_path(AMP)
+        fd = dev_path + "/sep1/fd0"
+        mode = {"profile": "audio", "fix": True}  # profile: audio | nothing | fail
+
+        def transport_up():
+            eng._on_interfaces_added(fd, {"org.bluez.MediaTransport1":
+                                          {"State": Variant("s", "idle")}})
+
+        def transport_down():
+            eng._on_interfaces_removed(fd, ["org.bluez.MediaTransport1"])
+
+        async def connect_amp_audio():
+            rig.calls.append(("ConnectProfile", "amp"))
+            if mode["profile"] == "fail":
+                return False, "org.bluez.Error.Failed"
+            if mode["profile"] == "audio":
+                transport_up()
+            return True, None
+
+        async def fix_metadata():
+            rig.calls.append(("fix_metadata", "amp"))
+            if mode["fix"]:
+                transport_up()
+            return True, None
+
+        def reconnect_edge():
+            eng._dev_paths[AMP] = {dev_path: False}
+            eng._publish_device(AMP)
+            eng._dev_paths[AMP] = {dev_path: True}
+            eng._publish_device(AMP)
+
+        eng.connect_amp_audio = connect_amp_audio
+        eng.fix_metadata = fix_metadata
+        try:
+            rig.node.roster.set_amp(AMP, "Amp")
+            rig.add_device(AMP, "Amp", paired=True, connected=True)
+            eng._dev_paths[AMP] = {dev_path: True}
+            eng._publish_device(AMP)  # connected, and no transport
+            assert app.amp_connected and not app.amp_audio
+            await rig.wait(lambda: app.amp_audio)
+            assert rig.calls == [("ConnectProfile", "amp")], rig.calls
+            await rig.wait(lambda: (rig.api_node.audio.get("amp") or {}).get("audio") is True)
+            st, state = await c.req("GET", "/state")
+            assert state["amp"]["audio"] is True and state["amp"]["last_result"]["ok"], state["amp"]
+            st, v = await c.req("GET", "/verify")
+            assert {x["id"]: x for x in v["checks"]}["amp_audio"]["ok"] is True, v
+
+            # ConnectProfile says yes but no transport follows: the full reconnect
+            rig.calls.clear()
+            mode["profile"] = "nothing"
+            transport_down()
+            assert not app.amp_audio
+            await rig.wait(lambda: app.amp_audio)
+            assert rig.calls == [("ConnectProfile", "amp"), ("fix_metadata", "amp")], rig.calls
+
+            # review 6: a failed call doesn't sit out the wait for nothing
+            speakerd_main.AMP_AUDIO_WAIT_S = 3
+            rig.calls.clear()
+            mode["profile"] = "fail"
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            transport_down()
+            await rig.wait(lambda: app.amp_audio)
+            assert loop.time() - t0 < 1.5, "waited after a failed ConnectProfile"
+            assert rig.calls == [("ConnectProfile", "amp"), ("fix_metadata", "amp")], rig.calls
+            speakerd_main.AMP_AUDIO_WAIT_S = 0.2
+
+            # review 1: the grace counts from the latest connect
+            speakerd_main.AMP_AUDIO_GRACE_S = 0.4
+            mode["profile"] = "audio"
+            rig.calls.clear()
+            transport_down()
+            await asyncio.sleep(0.25)
+            reconnect_edge()  # restarts the grace: nothing before ~0.65 s
+            await asyncio.sleep(0.25)
+            assert rig.calls == [], rig.calls
+            await rig.wait(lambda: app.amp_audio)
+            assert rig.calls == [("ConnectProfile", "amp")], rig.calls
+            speakerd_main.AMP_AUDIO_GRACE_S = 0.05
+
+            # review 2: after giving up, a slow retry of ConnectProfile alone
+            mode["profile"], mode["fix"] = "nothing", False
+            rig.calls.clear()
+            transport_down()
+            await rig.wait(lambda: rig.calls.count(("ConnectProfile", "amp")) >= 3)
+            assert rig.calls[:3] == [("ConnectProfile", "amp"), ("fix_metadata", "amp"),
+                                     ("fix_metadata", "amp")], rig.calls
+            assert app.last_result("amp")["ok"] is False
+            assert rig.calls[3:] and set(rig.calls[3:]) == {("ConnectProfile", "amp")}, rig.calls
+            mode["profile"] = "audio"
+            await rig.wait(lambda: app.amp_audio)
+            await rig.wait(lambda: app.last_result("amp")["ok"] is True)
+            n = len(rig.calls)
+            await asyncio.sleep(0.3)
+            assert len(rig.calls) == n, "the slow retry must stop once the audio is back"
+
+            # review 5: a late State for a transport already removed doesn't
+            # bring it back
+            transport_down()
+            eng._on_props_changed(fd, "org.bluez.MediaTransport1",
+                                  {"State": Variant("s", "active")})
+            assert fd not in eng._transports and not app.amp_audio
+            await rig.wait(lambda: app.amp_audio)  # and the restore still runs
+
+            # review 3: device calls go to the path the amp is connected on
+            other = dev_path.replace("/hci0/", "/hci1/")
+            eng._dev_paths[AMP] = {dev_path: False, other: True}
+            assert eng._call_path(AMP) == other
+            eng._dev_paths[AMP] = {other: False}
+            assert eng._call_path(AMP) == dev_path, "disconnected: our own adapter"
+            eng._dev_paths[AMP] = {dev_path: True}
+
+            # auto-reconnect switched off: the audio link is left alone
+            app.set_auto_reconnect(False)
+            rig.calls.clear()
+            transport_down()
+            await asyncio.sleep(0.3)
+            assert not app.amp_audio and rig.calls == [], rig.calls
+            st, v = await c.req("GET", "/verify")
+            chk = {x["id"]: x for x in v["checks"]}["amp_audio"]
+            assert chk["ok"] is False and "nowhere to play" in chk["detail"], chk
+        finally:
+            for k, v in saved.items():
+                setattr(speakerd_main, k, v)
+    await with_rig(tmp, body)
+    print("amp_audio_restore: PASS")
+
+
 async def test_reset_request(tmp):
     rig = Rig(tmp)
     node = rig.api_node
@@ -670,7 +814,8 @@ async def main():
         os.environ.setdefault("FAKE_SYSTEMCTL_LOG", os.devnull)
         for test in (test_unclaimed_and_https_rules, test_planted_claim, test_claimed_auth,
                      test_sse, test_phones_and_pairing, test_speakerd_away, test_verify_merge,
-                     test_agent_rejects, test_update, test_review_fixes, test_reset_request,
+                     test_agent_rejects, test_update, test_review_fixes,
+                     test_amp_audio_restore, test_reset_request,
                      test_control_protocol, test_wifi_input):
             with tempfile.TemporaryDirectory() as tmp:
                 await test(tmp)

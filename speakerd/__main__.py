@@ -25,6 +25,17 @@ from .system import power
 
 log = logging.getLogger("speakerd")
 
+# how long the amp must stay connected without its A2DP link, counted from its
+# latest connect, before speakerd restores it: a normal connect brings the
+# audio up within a second or two (about 60 ms on .156)
+AMP_AUDIO_GRACE_S = 10
+# how long a restore attempt waits for the transport after BlueZ said yes
+AMP_AUDIO_WAIT_S = 5
+# after the restore gives up: ask for the audio link alone this often, for as
+# long as the amp stays connected without it. ConnectProfile never disconnects
+# the amp, and nothing can be playing in that state, so it disturbs nothing
+AMP_AUDIO_SLOW_RETRY_S = 60
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -87,6 +98,11 @@ class App:
         self._amp_user_disconnected = False
         self._auto_reconnect = _load_auto_reconnect(cfg.state_file)
         self._amp_reconnect_task: asyncio.Task | None = None
+        # the amp's A2DP link, apart from Connected (see amp_audio_changed);
+        # the engine holds the value itself, App only reacts to its edges
+        self._amp_audio_task: asyncio.Task | None = None
+        self._amp_connects = 0  # counts Connected=True edges: restarts the grace
+        self._amp_edge = asyncio.Event()  # replaced on every amp edge, see _amp_edge_fire
 
         subscriptions = [
             (cfg.topic("device", "+", "set"), 1),
@@ -170,6 +186,10 @@ class App:
         return self._amp_connected
 
     @property
+    def amp_audio(self) -> bool:
+        return self.roster.amp is not None and self.engine.amp_audio
+
+    @property
     def auto_reconnect(self) -> bool:
         return self._auto_reconnect
 
@@ -211,8 +231,9 @@ class App:
     def amp_roster_changed(self) -> None:
         """The API paired or forgot the amp."""
         if self.roster.amp is None:
-            if self._amp_reconnect_task is not None:
-                self._amp_reconnect_task.cancel()
+            for task in (self._amp_reconnect_task, self._amp_audio_task):
+                if task is not None:
+                    task.cancel()
             self._amp_connected = False
             self._last_results.pop(AMP_SLUG, None)
             self._publish_retained(self.cfg.topic("device", AMP_SLUG, "connected"), "OFF")
@@ -227,10 +248,32 @@ class App:
         if slug == AMP_SLUG:
             self._amp_connected = connected
             if connected:
+                self._amp_connects += 1
                 self._amp_user_disconnected = False
+                self._maybe_restore_amp_audio()
             else:
                 self._maybe_auto_reconnect_amp()
+            self._amp_edge_fire()
         self._changed()
+
+    def amp_audio_changed(self, has: bool) -> None:
+        """BluezEngine: the amp's A2DP transport came or went. Connected alone
+        says nothing about it: the ACL link and AVRCP can stay up with the
+        audio link gone (a WirePlumber restart drops it), and then AirPlay
+        plays into nothing while everything reads "connected"."""
+        if self.roster.amp is None:
+            return
+        log.info("amp audio link: %s", "up" if has else "down")
+        if not has:
+            self._maybe_restore_amp_audio()
+        self._amp_edge_fire()
+        self._changed()
+
+    def _amp_edge_fire(self) -> None:
+        """Wake whoever waits in _wait_amp: the amp connected, dropped, or
+        its audio link came or went."""
+        edge, self._amp_edge = self._amp_edge, asyncio.Event()
+        edge.set()
 
     def streaming_changed(self, on: bool) -> None:
         log.info("bluetooth streaming: %s", on)
@@ -337,6 +380,7 @@ class App:
             # a drop edge that landed while we held the lock was suppressed;
             # re-evaluate now that the lock is free
             self._maybe_auto_reconnect_amp()
+            self._maybe_restore_amp_audio()
         return ok, err
 
     async def _fix_metadata(self) -> tuple[bool, str | None]:
@@ -348,9 +392,71 @@ class App:
         # a drop edge (or gate-ON) that landed while we held the lock was
         # suppressed; re-evaluate now that the lock is free
         self._maybe_auto_reconnect_amp()
+        self._maybe_restore_amp_audio()
         return ok, err
 
-    # ------------------------------------------------- amp auto-reconnect
+    # ------------------------------------------------- amp recovery
+    #
+    # Two recoveries share one retry loop (_amp_retry): auto-reconnect for an
+    # amp that dropped, and the audio-link restore for an amp that stayed
+    # connected without its A2DP transport. Both obey the same gates (the
+    # auto-reconnect switch, a deliberate disconnect) and re-check them under
+    # the amp lock before every attempt, so a manual command, fix_metadata or
+    # the amp itself fixing things first always wins.
+
+    def _amp_gates_open(self) -> bool:
+        return (self.roster.amp is not None and self._auto_reconnect
+                and not self._amp_user_disconnected)
+
+    def _amp_needs_reconnect(self) -> bool:
+        return self._amp_gates_open() and not self._amp_connected
+
+    def _amp_needs_audio(self) -> bool:
+        return self._amp_gates_open() and self._amp_connected and not self.amp_audio
+
+    async def _wait_amp(self, cond, timeout: float) -> bool:
+        """Until cond() holds, woken by amp edges rather than polling; False
+        if it still doesn't after `timeout` seconds."""
+        loop = asyncio.get_running_loop()
+        end = loop.time() + timeout
+        while not cond():
+            left = end - loop.time()
+            if left <= 0:
+                return False
+            try:
+                await asyncio.wait_for(self._amp_edge.wait(), left)
+            except asyncio.TimeoutError:
+                return cond()
+        return True
+
+    async def _amp_retry(self, what: str, needed, attempt_fn, done,
+                         wait_s: float, fail_msg: str) -> bool | None:
+        """Up to amp_reconnect_tries attempts. Each re-checks needed() under
+        the amp lock, runs attempt_fn(attempt) there, then waits up to wait_s
+        for done(). True on success, False on giving up, None when it stopped
+        mattering (the gate closed, or someone else fixed it)."""
+        cfg = self.cfg
+        err: str | None = None
+        for attempt in range(1, cfg.amp_reconnect_tries + 1):
+            async with self._locks[AMP_SLUG]:
+                if not needed():
+                    return None
+                log.info("%s: attempt %d/%d", what, attempt, cfg.amp_reconnect_tries)
+                ok, err = await attempt_fn(attempt)
+            # a drop edge that landed while we held the lock was suppressed
+            self._maybe_auto_reconnect_amp()
+            # a failed call can still race a link that came up on its own
+            # (InProgress): check, but don't sit out the wait for nothing
+            if done() or (ok and await self._wait_amp(done, wait_s)):
+                self._record_result(AMP_SLUG, what, True, None, attempt=attempt)
+                return True
+            if ok:
+                err = fail_msg
+            if attempt < cfg.amp_reconnect_tries:
+                await asyncio.sleep(cfg.amp_reconnect_retry_delay_s)
+        log.error("%s: giving up after %d attempts (%s)", what, cfg.amp_reconnect_tries, err)
+        self._record_result(AMP_SLUG, what, False, err, attempt=cfg.amp_reconnect_tries)
+        return False
 
     def _maybe_auto_reconnect_amp(self) -> None:
         """Schedule a reconnect cycle after an unexpected amp drop.
@@ -360,8 +466,7 @@ class App:
         filtered out: the amp lock is held during fix_metadata / manual
         commands, and a user OFF sets _amp_user_disconnected.
         """
-        if (self.roster.amp is None or not self._auto_reconnect
-                or self._amp_user_disconnected or self._amp_connected):
+        if not self._amp_needs_reconnect():
             return
         if self._locks[AMP_SLUG].locked():
             return  # deliberate amp operation in flight
@@ -370,43 +475,76 @@ class App:
         self._amp_reconnect_task = self._spawn(self._amp_auto_reconnect())
 
     async def _amp_auto_reconnect(self) -> None:
-        cfg = self.cfg
-        await asyncio.sleep(cfg.amp_reconnect_debounce_s)
-        err: str | None = None
-        for attempt in range(1, cfg.amp_reconnect_tries + 1):
-            if not self._auto_reconnect or self._amp_user_disconnected:
-                return
+        await asyncio.sleep(self.cfg.amp_reconnect_debounce_s)
+
+        async def connect(_attempt):
+            return await self.engine.connect_device(AMP_SLUG)
+
+        # BlueZ can send the Connect reply before the batched Connected=True
+        # PropertiesChanged: wait briefly for the edge rather than misread a
+        # good connect as an instant drop
+        await self._amp_retry("auto_reconnect", self._amp_needs_reconnect, connect,
+                              lambda: self._amp_connected, 1.0,
+                              "link dropped immediately after connect")
+
+    def _maybe_restore_amp_audio(self) -> None:
+        """Schedule a restore when the amp is connected without its A2DP
+        link.
+
+        Unlike _maybe_auto_reconnect_amp there is no "lock held: return"
+        here, on purpose: the Connected=True edge of an auto-reconnect lands
+        while that cycle holds the lock, and suppressing it would leave an
+        amp that came back without audio with nobody to restore it. The task
+        waits out its grace first and then takes the lock, so scheduling it
+        early is harmless. One task covers the whole outage, its slow retry
+        included."""
+        if not self._amp_needs_audio():
+            return
+        if self._amp_audio_task is not None and not self._amp_audio_task.done():
+            return
+        self._amp_audio_task = self._spawn(self._restore_amp_audio())
+
+    async def _restore_amp_audio(self) -> None:
+        # the grace counts from the LATEST connect: a reconnect while we wait
+        # starts it again, so its A2DP gets the same moment to come up
+        while True:
+            connects = self._amp_connects
+            await asyncio.sleep(AMP_AUDIO_GRACE_S)
+            if self._amp_connects == connects:
+                break
+        if not self._amp_needs_audio():
+            return
+
+        async def restore(attempt):
+            log.warning("amp connected without its audio link: restoring it")
+            # first the audio link alone; then the whole connection, the
+            # same Disconnect + Connect as POST /amp/reconnect
+            if attempt == 1:
+                return await self.engine.connect_amp_audio()
+            return await self.engine.fix_metadata()
+
+        result = await self._amp_retry("audio_reconnect", self._amp_needs_audio, restore,
+                                       lambda: self.amp_audio, AMP_AUDIO_WAIT_S,
+                                       "no audio link after the reconnect")
+        if result is not False:
+            return
+        # gave up: keep asking for the audio link alone, slowly, for as long as
+        # the amp stays connected without it (docs/SETUP-API.md auto-reconnect)
+        log.warning("amp audio link: retrying every %d s while the amp stays connected "
+                    "without it", AMP_AUDIO_SLOW_RETRY_S)
+        while True:
+            await asyncio.sleep(AMP_AUDIO_SLOW_RETRY_S)
             async with self._locks[AMP_SLUG]:
-                # re-check under the lock: the gate may have been switched off
-                # while we waited on it, or a manual command, fix_metadata, or
-                # the amp itself may have restored the link while we slept
-                if (not self._auto_reconnect or self._amp_connected
-                        or self._amp_user_disconnected):
+                if not self._amp_needs_audio():
                     return
-                log.info("amp auto-reconnect: attempt %d/%d",
-                         attempt, cfg.amp_reconnect_tries)
-                ok, err = await self.engine.connect_device(AMP_SLUG)
-            if ok and not self._amp_connected:
-                # BlueZ can send the Connect reply before the batched
-                # Connected=True PropertiesChanged: wait briefly for the edge
-                # rather than misread a good connect as an instant drop
-                for _ in range(10):
-                    await asyncio.sleep(0.1)
-                    if self._amp_connected:
-                        break
-            if ok and not self._amp_connected:
-                # connect-ok + instant drop: the drop edge was suppressed
-                # (this cycle is still running) — a failed attempt, not a success
-                ok, err = False, "link dropped immediately after connect"
-            if ok:
-                self._record_result(AMP_SLUG, "auto_reconnect", True, None, attempt=attempt)
+                ok, err = await self.engine.connect_amp_audio()
+            if self.amp_audio or (ok and await self._wait_amp(lambda: self.amp_audio,
+                                                              AMP_AUDIO_WAIT_S)):
+                log.info("amp audio link: restored by the slow retry")
+                self._record_result(AMP_SLUG, "audio_reconnect", True, None, slow=True)
                 return
-            if attempt < cfg.amp_reconnect_tries:
-                await asyncio.sleep(cfg.amp_reconnect_retry_delay_s)
-        log.error("amp auto-reconnect: giving up after %d attempts (%s)",
-                  cfg.amp_reconnect_tries, err)
-        self._record_result(AMP_SLUG, "auto_reconnect", False, err,
-                            attempt=cfg.amp_reconnect_tries)
+            log.info("amp audio link: slow retry failed (%s)",
+                     err if not ok else "no audio link after ConnectProfile")
 
     def _set_auto_reconnect(self, enabled: bool) -> None:
         if enabled != self._auto_reconnect:
@@ -420,6 +558,7 @@ class App:
             # even after a deliberate OFF, and act now if the amp is down
             self._amp_user_disconnected = False
             self._maybe_auto_reconnect_amp()
+            self._maybe_restore_amp_audio()
 
     # ------------------------------------------------- system power commands
 

@@ -946,6 +946,23 @@ verify() {
         else
             bad "amplifier $amp is not paired and trusted"
         fi
+        # Connected is not enough: the audio link (A2DP) can be gone with the
+        # amp still connected for control, and then AirPlay plays into
+        # nothing. speakerd restores it on its own: 10 s of grace, ConnectProfile,
+        # a 10 s retry delay, then a full reconnect -- about 30 s usually, but
+        # over 80 s if BlueZ sits on a call to its 30 s timeout. The wait is
+        # sized past that: a failure here under update.sh rolls a working
+        # update back. An amp that is simply off is not a failed install.
+        if printf '%s' "$info_amp" | grep -q 'Connected: yes'; then
+            sep="/dev_$(printf '%s' "$amp" | tr : _)/sep[0-9]*/fd"
+            if within 120 sh -c "busctl --system tree --list org.bluez | grep -q '$sep'"; then
+                ok "amplifier $amp has its audio link (A2DP)"
+            else
+                bad "amplifier $amp is connected without its audio link (A2DP): AirPlay has nowhere to play"
+            fi
+        else
+            info "amplifier $amp is not connected right now (off?): its audio link was not checked"
+        fi
         if user_ctl is-active --quiet speakerd.service; then
             since=$(epoch "$(user_ctl show --timestamp=unix -p ExecMainStartTimestamp --value speakerd.service)")
             if within 15 sh -c "journalctl _UID=$NAP_UID _SYSTEMD_USER_UNIT=speakerd.service \

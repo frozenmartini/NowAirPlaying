@@ -282,7 +282,7 @@ stream (`text/event-stream`):
                       "reason": null, "message": null, "rolled_back": false}},
   "network": {"link": "wifi", "ssid": "Home", "signal": 71, "ip": "192.168.1.42"},
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
-          "paired": true, "connected": true, "auto_reconnect": true,
+          "paired": true, "connected": true, "audio": true, "auto_reconnect": true,
           "last_result": {"ok": true, "error": null, "at": "2026-10-02T15:40:12-07:00"}},
   "phones": {
     "pairing": {"open": false, "until": null, "last_paired": null},
@@ -306,7 +306,8 @@ stream (`text/event-stream`):
 | `now_playing.*.status` | `playing`, `paused` or `idle`. A source that goes idle clears its track fields |
 | `now_playing.bluetooth` | `duration` and `position` in milliseconds when the phone reports them; `device` is the phone's name (its roster name, else its Bluetooth name), for display. Match on a phone by `phones.devices[].mac` |
 | `amp` | `null` before pairing |
-| `amp.last_result`, `devices[].last_result` | the most recent connect or disconnect attempt: `ok`, BlueZ's error name if it failed, and when |
+| `amp.audio` | from `0.0.3`: the Pi's audio link to the amp (A2DP) is up. `connected` alone doesn't mean AirPlay can play: the control link can stay up with the audio link gone. speakerd restores it on its own (see auto-reconnect) |
+| `amp.last_result`, `devices[].last_result` | the most recent connect, disconnect or audio-link restore attempt: `ok`, BlueZ's error name if it failed, and when |
 | `phones.pairing` | `until` is when the window closes; `last_paired` is the MAC of the last phone paired in it |
 | `network.link` | `wifi` or `ethernet`. `ssid` and `signal` (0–100) are `null` on Ethernet |
 | `node.update` | progress of an update; see below |
@@ -350,7 +351,12 @@ level can't be set from outside. A relative step may come later.
   next connect, the same rule as Home Assistant's switch. `502 failed` if BlueZ refuses.
 - **reconnect:** disconnect, wait, connect. Any phone stays connected throughout.
 - **auto-reconnect:** whether speakerd reconnects the amp when it drops. It's stored, so
-  it survives a reboot.
+  it survives a reboot. From `0.0.3` it also covers the audio link: if the amp stays
+  connected without it for 10 seconds after its latest connect, speakerd reconnects the
+  audio link alone, then, if that isn't enough, does a full reconnect (three attempts in
+  all). If those fail, it keeps asking for the audio link alone every 60 seconds, for as
+  long as the amp stays connected without it. That never disconnects the amp. A
+  deliberate disconnect, or auto-reconnect off, leaves both alone.
 - **forget:** removes the pairing and clears the amp from the config. speakerd keeps
   running with no amp.
 
@@ -450,13 +456,14 @@ packages:
 | `speakerd_running` | the speakerd user service is active |
 | `amp_paired` | the configured amp is paired and trusted |
 | `amp_connected` | the amp is connected |
+| `amp_audio` | from `0.0.3`: the amp's audio link (A2DP) is up. Fails with "connected, but no audio link" when only the control link is up |
 | `amp_player` | exactly one player, speakerd's `/org/speakerd/player`, is registered on the amp's adapter |
 | `mqtt_connected` | only when MQTT is configured: speakerd is connected to the broker |
 
 **Which checks raise a repair** (agreed 2026-09-30): only a check that passed before and
 then fails several runs in a row. That covers AirPlay 2, PipeWire, nqptp, mDNS,
-speakerd and the polkit rules. "Amp not paired" raises one too. `amp_connected`, the
-player and MQTT only show on the card, since a sleeping amp is normal.
+speakerd and the polkit rules. "Amp not paired" raises one too. `amp_connected`,
+`amp_audio`, the player and MQTT only show on the card, since a sleeping amp is normal.
 
 ### Errors
 

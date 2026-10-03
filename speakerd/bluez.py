@@ -76,6 +76,7 @@ class BluezEngine:
         self._players: dict[str, dict] = {}            # path -> {mac,status,track,position,seq}
         self._seq = 0
 
+        self._amp_audio_published: bool | None = None
         self._streaming_current = False
         self._streaming_published = False
         self._streaming_task: asyncio.Task | None = None
@@ -249,8 +250,11 @@ class BluezEngine:
                     self._publish_device(mac)
 
         elif iface == TRANSPORT_IFACE and "State" in changed:
-            mac = _mac_from_path(path)
-            if mac is not None:
+            # only a transport we know: a late State for one already removed
+            # (rescan replays buffered signals) must not bring it back, or a
+            # missing audio link would read as present
+            if path in self._transports:
+                mac = self._transports[path][0]
                 self._transports[path] = (mac, str(changed["State"].value))
                 self._recompute_streaming()
 
@@ -288,6 +292,7 @@ class BluezEngine:
                 self._notify("devices_changed")
         if TRANSPORT_IFACE in ifaces:
             self._recompute_streaming()
+            self._publish_amp_audio()
         if PLAYER_IFACE in ifaces:
             self._publish_now_playing()
 
@@ -302,6 +307,7 @@ class BluezEngine:
         if TRANSPORT_IFACE in ifaces and path in self._transports:
             del self._transports[path]
             self._recompute_streaming()
+            self._publish_amp_audio()
         if PLAYER_IFACE in ifaces and path in self._players:
             del self._players[path]
             self._publish_now_playing()
@@ -325,6 +331,7 @@ class BluezEngine:
     def _publish_all(self, force: bool) -> None:
         for dev in self._roster.all_devices:
             self._publish_device(dev.mac, force=force)
+        self._publish_amp_audio(force=force)
         self._recompute_streaming()
         if force:
             # seed the retained topic even when the value never changed (startup)
@@ -336,6 +343,24 @@ class BluezEngine:
         if force or self._connected.get(mac) != connected:
             self._connected[mac] = connected
             self._sink.device_changed(self._roster.by_mac[mac].slug, connected)
+
+    @property
+    def amp_audio(self) -> bool:
+        """The one copy of this value: App.amp_audio reads it here."""
+        return bool(self._amp_audio_published)
+
+    def _publish_amp_audio(self, force: bool = False) -> None:
+        """Whether the amp has an A2DP transport: the Pi's audio link to it.
+        Connected alone isn't enough. The ACL link and AVRCP can stay up with
+        the audio link gone (a WirePlumber restart drops it), and then AirPlay
+        plays into nothing while everything reads "connected"."""
+        amp = self._roster.amp_mac
+        has = amp is not None and any(mac == amp for mac, _ in self._transports.values())
+        if force or has != self._amp_audio_published:
+            self._amp_audio_published = has
+            cb = getattr(self._sink, "amp_audio_changed", None)
+            if cb is not None:
+                cb(has)
 
     def _recompute_streaming(self) -> None:
         # every device but the amp is a source: the amp's own transport is the
@@ -415,6 +440,11 @@ class BluezEngine:
         await asyncio.sleep(self._cfg.fix_metadata_delay_s)
         return await self._device_call("amp", "Connect")
 
+    async def connect_amp_audio(self) -> tuple[bool, str | None]:
+        """ConnectProfile(A2DP sink) on the amp: the audio link alone, without
+        dropping the rest of the connection."""
+        return await self._device_call("amp", "ConnectProfile", "s", [A2DP_SINK_UUID])
+
     async def transport_command(self, cmd: str) -> tuple[bool, str | None]:
         player = self._current_player()
         if player is None:
@@ -432,15 +462,22 @@ class BluezEngine:
         except _DBusCallError as e:
             return False, str(e)
 
-    async def _device_call(self, slug: str, member: str) -> tuple[bool, str | None]:
+    def _call_path(self, mac: str) -> str:
+        """Where to send a device call: the path the device is connected on,
+        if any (it can exist on several adapters), else our own adapter's."""
+        connected = sorted(p for p, c in self._dev_paths.get(mac, {}).items() if c)
+        return connected[0] if connected else self.device_path(mac)
+
+    async def _device_call(self, slug: str, member: str, signature: str = "",
+                           body: list | None = None) -> tuple[bool, str | None]:
         dev = self._roster.by_slug.get(slug)
         if dev is None:
             return False, f"unknown device {slug!r}"
-        paths = sorted(self._dev_paths.get(dev.mac, {}))
-        path = paths[0] if paths else self.device_path(dev.mac)
+        path = self._call_path(dev.mac)
         log.info("%s %s (%s)", member, dev.name, path)
         try:
-            await self._call(BLUEZ, path, DEVICE_IFACE, member, timeout=CONNECT_TIMEOUT_S)
+            await self._call(BLUEZ, path, DEVICE_IFACE, member, signature, body,
+                             timeout=CONNECT_TIMEOUT_S)
             return True, None
         except _DBusCallError as e:
             log.warning("%s %s failed: %s", member, dev.name, e)
