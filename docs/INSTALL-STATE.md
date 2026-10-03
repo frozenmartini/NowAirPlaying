@@ -40,7 +40,7 @@ LC_ALL=C sudo -S -k -p '' systemd-run --unit=nowairplaying-install --collect --q
 | `--version` | `N.N.N`, the pinned release |
 | `--url` | the asset URL: `https://….tar.gz`, or `file:///….tar.gz` for tests |
 | `--sha256` | 64 lowercase hex characters |
-| `--user` | the Imager user, who runs the audio stack. Required: under `systemd-run` there is no `SUDO_USER` |
+| `--user` | the SSH login user (the Imager user). Required: under `systemd-run` there is no `SUDO_USER`. From `0.0.2` the audio runs as the system account `nowairplaying`, not as this user. The install moves this user's planted `claim-token` into place and adds them to group `nowairplaying` ([SETUP-API](SETUP-API.md#ownership-unclaimed-and-claimed)) |
 | `--name` | the room name, e.g. `Bathroom`. It must not start with `-`, or contain quotes, backslashes, `/` or `&` |
 | `--phones` | `onboard` (version A, the default) or `dongle` (version B). Phone Bluetooth isn't built yet, so it changes nothing so far |
 
@@ -59,14 +59,17 @@ unit with that name. `systemctl is-active nowairplaying-install` needs no `sudo`
 ## install.json
 
 `/var/lib/nowairplaying/install.json` is written by root and is mode 0644. It holds no
-secrets. It is replaced atomically, so a reader never sees half a file.
+secrets. It is replaced atomically, so a reader never sees half a file. The first install
+and every later update ([`POST /node/update`](SETUP-API.md#post-nodeupdate)) write the
+same file.
 
 ```json
 {"state": "failed", "version": "0.0.1",
  "phase": 0, "phase_name": "download",
  "started": "2026-10-01T14:03:11-07:00", "finished": "2026-10-01T14:03:40-07:00", "exit": 22,
  "reason": "download_failed", "message": "curl: (22) The requested URL returned error: 404",
- "log": "/var/log/nowairplaying-install.log", "log_offset": 48213}
+ "log": "/var/log/nowairplaying-install.log", "log_offset": 48213,
+ "cert_sha256": null, "rolled_back": false}
 ```
 
 | Field | Meaning |
@@ -76,10 +79,16 @@ secrets. It is replaced atomically, so a reader never sees half a file.
 | `phase`, `phase_name` | `0 download`, `1 preflight`, `2 apt`, `3 packages`, `4 units`, `5 configure`, `6 verify`: the last one reached |
 | `started`, `finished` | ISO 8601. `finished` is `null` while installing |
 | `exit` | the exit status; `null` while installing |
-| `reason` | `null` unless failed: `bad_arguments`, `download_failed`, `hash_mismatch`, `unpack_failed`, `install_failed` or `verify_failed` |
+| `reason` | `null` unless failed: `bad_arguments`, `download_failed`, `hash_mismatch`, `unpack_failed`, `preflight_conflict`, `install_failed`, `verify_failed` or `downgrade` |
 | `message` | `null` unless failed: the error line, e.g. the installer's last `ERROR:` line or `2 check(s) FAILED.` |
 | `log`, `log_offset` | the log, 0644 and appended across runs, and the byte where this run starts |
+| `cert_sha256` | from `0.0.2`, once `done`: the SHA-256 of the API certificate in DER form, lowercase hex. HA pins it ([SETUP-API](SETUP-API.md#trust-the-pinned-certificate)). `null` before |
+| `rolled_back` | `true` when an update failed verify and the previous release was reinstalled |
 
+- **`preflight_conflict`** means the Pi already runs something NowAirPlaying would
+  break: a desktop, another AirPlay receiver, or another program on our ports (8443,
+  8080, UDP 319/320). Nothing was changed. `message` names the conflict. Ordinary
+  scripts and agents are not conflicts.
 - **`done`** means the installer finished with exit 0. Steps may still be left, such as
   pairing the amp.
 - **`install.sh --verify`** only checks, and never touches `install.json`.

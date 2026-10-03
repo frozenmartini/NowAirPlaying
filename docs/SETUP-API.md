@@ -1,182 +1,293 @@
-# Setup API and setup page
+# Node API and setup page (v2)
 
-**Status: draft for review. Nothing here is implemented yet.**
+**Status: draft for review. Nothing here is implemented yet.** It replaces the v1 draft,
+which was never built.
 
-**Setup starts in Home Assistant (2026-09-28).** Its integration gives the user what
-they need to flash the card (see [ROADMAP](ROADMAP.md#3-guided-setup)).
+**Agreed with Home Assistant (`kohler-anthem-plus#003`):**
+- **Install over SSH, then this API** (2026-09-30). The install is in
+  [INSTALL-STATE](INSTALL-STATE.md).
+- **No MQTT between Home Assistant and the node** (2026-10-02). Home Assistant talks to
+  the node directly through this API, builds the entities itself, and owns the one
+  device card. Since Core 2026.8 a device belongs to exactly one config entry, so an MQTT
+  card could no longer merge with Home Assistant's own.
+- **HTTPS with a pinned certificate.** Home Assistant reads the fingerprint over SSH
+  during the install.
+- **State is pushed with SSE.** Commands are plain requests.
+- **Nothing the API can trigger runs as root,** except through the narrow polkit rules
+  listed under [Privileges](#privileges).
 
-**SSH for the install only, then this API (agreed 2026-09-30).** Home Assistant
-installs over SSH ([INSTALL-STATE](INSTALL-STATE.md)), then uses this API for
-everything else. The pairing facts under `POST /bt/pair` were confirmed on a real amp.
+Two clients use the API:
 
-A NowAirPlaying node is set up over the home network through one small HTTP API.
-Two clients use the same API:
-
+- **the Home Assistant integration** (`kohler_anthem_plus`): it claims the node, pairs it
+  with the amplifier, shows its state, and runs Wi-Fi changes, updates and reboots;
 - **the node's own setup page**, opened in a phone or computer browser, for people
-  without Home Assistant (standalone);
-- **the Home Assistant integration** (`kohler_anthem_plus`), which finds the node,
-  hands it an MQTT login, pairs it with the amplifier and watches its health.
+  without Home Assistant.
 
-The API can do a short list of things and nothing else.
+MQTT stays in speakerd as an option for people without Home Assistant. It's set in
+`config.toml` by hand; the API doesn't configure it. See [MQTT](#mqtt).
 
 ## Principles
 
-- **Local only.** The API serves the home network and nothing else: no cloud, no
-  port forwarding, no remote access.
-- **Plain HTTP.** See [Why HTTP, not HTTPS](#why-http-not-https).
-- **Least privilege.** The service runs as the node's normal user, not root. It holds
-  one extra capability: binding port 80.
-- **One API, two clients.** The setup page is plain HTML and JavaScript calling the
-  same endpoints Home Assistant calls, so both paths are tested by the same code.
-
-## Getting on the network
-
-The node joins the home network by Ethernet, or by the Wi-Fi that Raspberry Pi Imager
-sets when the card is flashed. The API runs whenever the node is up.
+- **Local only.** The API serves the home network: no cloud, no port forwarding, no
+  remote access.
+- **A token only travels over HTTPS.** The setup page is plain HTTP, so browsers show no
+  certificate warning. It can do only what needs no token.
+- **Our own account.** Everything runs as the system account `nowairplaying`, not as the
+  login user, so the owner's own scripts or a code agent on the same Pi can't break it
+  by accident.
+- **Least privilege.** The ports are above 1024, so no capability is needed. Root is
+  reached only through the polkit rules under [Privileges](#privileges).
+- **One API, two clients.** The setup page calls the same endpoints Home Assistant
+  calls.
 
 ## The service
 
 | | |
 |---|---|
-| Unit | `nowairplaying-setup.service` (a system unit with `User=` the node user and `AmbientCapabilities=CAP_NET_BIND_SERVICE`) |
-| Listens on | port 80, all interfaces |
-| Address | `http://<hostname>.local/`, the Pi's host name, set in Raspberry Pi Imager and published by avahi. |
-| State file | `~/.config/nowairplaying/setup.json`, mode 0600 |
-| Writes | `~/.config/speakerd/config.toml` (the `[mqtt]`, `[node]` and `[bluetooth]` amp settings), then restarts the speakerd user service |
+| Process | **speakerd** serves the API itself, so the state it pushes is the state it holds. It starts with or without an amp and applies changes live, with no restart |
+| Unit | `speakerd.service`, a user unit of `nowairplaying`, which has linger, so it starts at boot with nobody logged in |
+| HTTPS API | port **8443**, all interfaces. Home Assistant reads the port from the zeroconf record and never hard-codes it |
+| HTTP setup page | port **8080**, all interfaces: `http://<hostname>.local:8080/` |
+| Home | `/var/lib/nowairplaying` (the account's home, mode 0755, so the SSH user can read `install.json` during the install. The secrets inside are 0600 or 0700) |
+| Config | `~nowairplaying/.config/speakerd/config.toml`, mode 0600 |
+| API state | `~nowairplaying/.config/nowairplaying/api.json`, mode 0600: the claim (the token's SHA-256, `claimed_by`, the time) |
+| Certificate | `/var/lib/nowairplaying/tls/cert.pem` and `key.pem`. Self-signed EC P-256, valid for 100 years, made once by the install |
+
+**The certificate is kept** across re-runs and updates. A new one is made only if the
+files are missing. Home Assistant pins it by fingerprint, not by name or expiry, so the
+long lifetime costs nothing.
 
 ## Discovery
 
 The node advertises itself with mDNS/zeroconf:
 
-- **Service type:** `_nowairplaying._tcp`, port 80.
+- **Service type:** `_nowairplaying._tcp`, on the HTTPS API port.
 - **Instance name:** the node's display name, e.g. `Bathroom Speaker`.
-- **TXT records:**
+- **TXT records** (the keys are unchanged since 2026-09-30; only `api` moved to 2):
 
 | Key | Example | Meaning |
 |---|---|---|
-| `api` | `1` | API major version |
-| `ver` | `1.0.0` | NowAirPlaying release |
-| `mac` | `B8:27:EB:12:34:56` | the Pi's Bluetooth adapter MAC, uppercase with colons. Home Assistant uses it as the config entry's `unique_id` and as the device-card `bluetooth` connection. |
+| `api` | `2` | API major version |
+| `ver` | `0.0.2` | NowAirPlaying release |
+| `mac` | `B8:27:EB:12:34:56` | the onboard Bluetooth adapter (`hci0`), uppercase with colons. Home Assistant uses it as the config entry's `unique_id` |
 | `id` | `nowairplaying_123456` | node id: stable, derived from the MAC, never renamed |
-| `state` | `unclaimed` | `unclaimed` or `claimed`. The install itself is tracked in `install.json` ([INSTALL-STATE](INSTALL-STATE.md)), because this record only exists once the install is done |
+| `state` | `unclaimed` | `unclaimed` or `claimed`. The install itself is tracked in `install.json` |
 
 Home Assistant's manifest matches `_nowairplaying._tcp.local.` and offers "New audio
-node found" for `state=unclaimed`.
+node found" for `state=unclaimed`. The record carries no fingerprint, since anyone on
+the network can publish a TXT record.
+
+## Trust: the pinned certificate
+
+- **Installed over SSH (the normal path).** When the install finishes, `install.json`
+  carries `cert_sha256`: the SHA-256 of the certificate in DER form, lowercase hex. HA
+  reads it over the same SSH session and pins it before its first API call. Nothing is
+  trusted on first contact.
+- **Installed by hand,** then found by Home Assistant through zeroconf: there's no SSH
+  session to read the fingerprint from. HA pins the certificate it sees at `/claim`
+  (trust on first use) and checks it on every call after that.
+- **A changed certificate** means the card was rebuilt or the files were deleted. HA
+  stops calling the node and raises a repair. The user clears the claim with the
+  [reset file](#releasing-a-claim) and claims again.
 
 ## Ownership: unclaimed and claimed
 
 | State | Who may change the node | Setup page |
 |---|---|---|
-| **unclaimed** (fresh, or standalone) | anyone on the home network, with no token | full controls: pair, connect, disconnect, forget, verify |
-| **claimed** (by Home Assistant) | only the holder of the token, i.e. Home Assistant | read-only status plus "Managed by Home Assistant at `<host>`"; the Bluetooth connect and disconnect buttons stay available (see below) |
+| **unclaimed** (fresh, or standalone) | anyone on the home network, with no token | full controls: pair the amp, connect, disconnect, forget, phones, verify |
+| **claimed** (by Home Assistant) | only the holder of the token, over HTTPS | read-only status plus "Managed by Home Assistant at `<host>`". Amp connect and disconnect stay available (see below) |
 
 - **A standalone node stays unclaimed.** The home network is trusted for a device you
   just set up yourself, the same way a new speaker or streaming stick is.
 - **Claiming** is the one step that locks the node to one Home Assistant.
   - **A planted claim token, when present.** Before the install, Home Assistant writes
-    `~/.config/nowairplaying/claim-token` over SSH.
+    `~/.config/nowairplaying/claim-token` over SSH, as the login user with no `sudo`.
     - The file holds the lowercase hex SHA-256 of 32 random bytes. It is mode 0600.
+    - **The install moves it** to `/var/lib/nowairplaying/claim/claim-token`, owned by
+      `nowairplaying`, mode 0600.
+    - That directory is mode 2770, group `nowairplaying`. The install adds the login
+      user (`--user`) to that group. From their next SSH login, they can plant a fresh
+      token there directly, still without `sudo`.
     - `/claim` then needs `Authorization: Bearer <the 64-hex bytes>`.
     - The file is read on **every** `/claim` request, never once at startup. Whitespace
       around its contents is ignored.
     - A successful claim deletes it.
     - `GET /info` reports `"claim": "token"` or `"open"`.
-  - **Otherwise the first claimer wins.** That covers a node installed by hand and found
-    by Home Assistant through zeroconf.
-- **Releasing a claim:**
-  - **From Home Assistant:** deleting the node's config entry calls `POST /release`.
-  - **Without Home Assistant**, for example if it's gone for good: power the Pi off, put
-    an empty file named `nowairplaying-reset` on the SD card's boot partition (it shows
-    up as a small drive on any computer), and power it back on. The node clears its
-    claim and MQTT login, then deletes the file. Wi-Fi and the amp pairing are kept.
-    Physical access to the card is the proof of ownership.
+  - **Otherwise the first claimer wins.** That covers a node installed by hand.
 - **The token** is 32 random bytes, returned once by `/claim`. The node stores only its
   SHA-256. It is sent as `Authorization: Bearer <token>`.
 
-**Connect and disconnect on a claimed node:** the page keeps these two buttons, so
+**Amp connect and disconnect on a claimed node:** the page keeps these two buttons, so
 someone standing next to the amp can free it (for example to pair a phone with the
 Kohler directly) without opening Home Assistant. They don't change the configuration.
-Pair, forget and release still need the token.
 
-## Endpoints (v1)
+### Releasing a claim
 
-All paths are under `/api/v1`. Bodies are JSON. **Auth** means a valid token is
-required when the node is claimed; when it is unclaimed, anyone on the network may call
-it.
+- **From Home Assistant:** deleting the node's config entry calls `POST /release`, best
+  effort. HA also removes everything it made for the node. If the node is unreachable,
+  the entry is removed anyway and the reset file is the fallback.
+- **Without Home Assistant,** for example if it's gone for good:
+  1. Power the Pi off.
+  2. Put an empty file named `nowairplaying-reset` on the SD card's boot partition. It
+     shows up as a small drive on any computer.
+  3. Power the Pi back on.
+
+  The node clears its claim, then deletes the file. Wi-Fi, the certificate and all
+  Bluetooth pairings are kept. Physical access to the card is the proof of ownership.
+
+## Endpoints
+
+All paths are under `/api/v2`. Bodies are JSON. The **Auth** column:
+
+- **none:** anyone, over HTTP or HTTPS.
+- **owner:** on an unclaimed node, anyone. On a claimed node, the token, over HTTPS only.
+- **token:** claimed nodes only, with the token, over HTTPS only. On an unclaimed node
+  these return `403 claim_required`: Wi-Fi, updates and power are Home Assistant
+  features.
+- **open:** anyone, even on a claimed node.
+
+A request that carries an `Authorization` header over HTTP is refused with
+`403 https_required`, and the node logs it. The token never needs to cross the
+network in the clear.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `GET /info` | none | identity and state |
+| `GET /info` | none | identity and claim state |
 | `GET /verify` | none | health checks |
-| `POST /claim` | none, unclaimed only | lock the node to one Home Assistant and give it an MQTT login |
-| `POST /mqtt` | token | replace the MQTT login (rotation) |
+| `GET /state` | owner | the full state, once |
+| `GET /events` | owner | the full state, then every change (SSE) |
+| `POST /claim` | none, unclaimed only, HTTPS only | lock the node to one Home Assistant |
 | `POST /release` | token | undo the claim |
-| `POST /bt/scan` | auth | start a Bluetooth scan |
-| `GET /bt/found` | none | devices seen by the scan |
-| `POST /bt/pair` | auth | pair, trust and connect the amp |
-| `POST /bt/connect` | none | connect the paired amp |
-| `POST /bt/disconnect` | none | disconnect the amp (it stays paired) |
-| `POST /bt/forget` | auth | unpair the amp |
+| `POST /amp/scan` | owner | start a Bluetooth scan for the amp |
+| `GET /amp/found` | owner | devices seen by the scan |
+| `POST /amp/pair` | owner | pair, trust and connect the amp |
+| `POST /amp/connect` | open | connect the paired amp |
+| `POST /amp/disconnect` | open | release the amp; it stays paired |
+| `POST /amp/reconnect` | owner | disconnect, wait, connect: restores the amp's track display ("fix metadata") |
+| `PUT /amp/auto-reconnect` | owner | `{"on": true}` or `{"on": false}` |
+| `POST /amp/forget` | owner | unpair the amp |
+| `POST /phones/pairing` | owner | open or close the phone pairing window |
+| `POST /phones/{mac}/connect` | owner | connect a paired phone |
+| `POST /phones/{mac}/disconnect` | owner | disconnect a phone |
+| `DELETE /phones/{mac}` | owner | forget a phone |
+| `POST /media/{source}/{action}` | owner | `source` is `airplay` or `bluetooth`; `action` is `playpause`, `next` or `previous` |
+| `PUT /node/name` | token | rename the node |
+| `POST /node/reboot` | token | reboot the Pi |
+| `POST /node/shutdown` | token | power the Pi off |
+| `POST /node/update` | token | install another release |
+| `POST /wifi` | token | join a Wi-Fi network, with rollback |
+
+Commands return once the node has acted, with `{"ok": true}` or an
+[error](#errors). The resulting state arrives as an SSE event; a client never needs to
+poll.
 
 ### `GET /info`
 
 ```json
 {
-  "api": 1,
-  "version": "1.0.0",
+  "api": 2,
+  "version": "0.0.2",
   "id": "nowairplaying_123456",
   "name": "Bathroom Speaker",
-  "area": "Bathroom",
   "mac": "B8:27:EB:12:34:56",
   "state": "claimed",
+  "claim": "open",
   "claimed_by": "homeassistant.local",
+  "phones": "onboard",
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
-          "paired": true, "connected": true},
-  "mqtt": {"configured": true, "connected": true}
+          "paired": true, "connected": true}
 }
 ```
 
-`amp` is `null` before pairing. **No response ever contains a password or the token.**
+`amp` is `null` before pairing. `claim` is `token` while a planted token waits and `open`
+otherwise. **No response ever contains a password, a key or the token** (except
+`/claim`'s one-time reply).
 
 ### `POST /claim`
 
 ```json
-{
-  "name": "Bathroom Speaker",
-  "area": "Bathroom",
-  "mqtt": {"host": "homeassistant.local", "ip": "192.168.1.10", "port": 1883,
-           "username": "nowairplaying_123456", "password": "…"}
-}
+{"name": "Bathroom Speaker", "area": "Bathroom", "claimed_by": "homeassistant.local"}
 ```
 
 - `200` → `{"token": "…"}`. `409 already_claimed` if the node is claimed.
-- **Effect:** writes `[mqtt]` and `[node]` into speakerd's config and restarts speakerd.
-  speakerd then publishes its Home Assistant discovery.
-- `ip` is the fallback when `host` doesn't resolve, for example across VLANs.
-  Home Assistant reads its hostname from the Supervisor at claim time.
-- The node id stays the MAC-derived `id`. `name` and `area` only set the display name
-  and the suggested area, so a later rename never re-keys any entity.
-- The call returns once the config is written. Home Assistant then polls
-  `GET /verify` until `mqtt_connected` passes, or times out and reports it.
-
-### `POST /mqtt`
-
-Same `mqtt` object as `/claim`. Replaces the login and restarts speakerd. `200` →
-`{"ok": true}`.
+- HTTPS only. Over HTTP it returns `403 https_required`.
+- The node id stays the MAC-derived `id`. `name` sets the display name (and the AirPlay
+  name); `area` is only stored and returned for HA. So a later rename never re-keys
+  anything.
+- **Effect:** speakerd stops publishing MQTT discovery and clears what it had published,
+  if MQTT is configured (see [MQTT](#mqtt)). The TXT `state` becomes `claimed`.
 
 ### `POST /release`
 
-- **Effect:** speakerd first clears its retained Home Assistant discovery and
-  announcement topics with empty publishes, so no ghost entities remain. Then `[mqtt]`
-  is removed, speakerd restarts standalone, and the state returns to `unclaimed`.
-- The amp pairing is kept.
+- **Effect:** the claim is cleared and the TXT `state` returns to `unclaimed`. MQTT
+  discovery resumes if MQTT is configured. All pairings are kept.
 - `200` → `{"ok": true}`.
 
-### `POST /bt/scan`, `GET /bt/found`
+### `GET /state` and `GET /events`
 
-- `POST /bt/scan`, body `{"seconds": 20}` (at most 30). `202` → `{"ok": true}`, or
+`GET /state` returns the state object once. `GET /events` is a Server-Sent Events
+stream (`text/event-stream`):
+
+- **The first event** is `event: state` with the full object.
+- **After that,** `event: change` carries an object holding only the top-level keys that
+  changed. Each one **replaces** that key's value whole; there's no deeper merging.
+- **Every event has an `id:`,** the node's change counter. A gap means a missed event;
+  the client reconnects.
+- **A comment line** (`: ping`) goes out every 15 seconds, so a dead link shows within
+  about 30 seconds.
+- **On reconnect,** the client always gets a fresh full `state`. `Last-Event-ID` is
+  ignored.
+- **The stream ends** when the claim is released or speakerd stops. The client
+  reconnects with backoff.
+
+**The state object:**
+
+```json
+{
+  "node": {"name": "Bathroom Speaker", "version": "0.0.2",
+           "update": {"state": "idle", "version": null, "phase_name": null,
+                      "reason": null, "message": null, "rolled_back": false}},
+  "network": {"link": "wifi", "ssid": "Home", "signal": 71, "ip": "192.168.1.42",
+              "change": {"state": "idle", "ssid": null, "reason": null}},
+  "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
+          "paired": true, "connected": true, "auto_reconnect": true,
+          "last_result": {"ok": true, "error": null, "at": "2026-10-02T15:40:12-07:00"}},
+  "phones": {
+    "pairing": {"open": false, "until": null, "last_paired": null},
+    "devices": [{"mac": "AA:BB:CC:DD:EE:01", "name": "Pat's iPhone", "connected": true,
+                 "last_result": {"ok": true, "error": null, "at": "…"}}]
+  },
+  "source": "airplay",
+  "bluetooth_streaming": false,
+  "now_playing": {
+    "airplay": {"status": "playing", "title": "…", "artist": "…", "album": "…",
+                "client": "Pat's iPhone"},
+    "bluetooth": {"status": "idle", "title": null, "artist": null, "album": null,
+                  "duration": null, "position": null, "device": null}
+  }
+}
+```
+
+| Key | Values |
+|---|---|
+| `source` | `airplay`, `bluetooth`, `both` or `idle` |
+| `now_playing.*.status` | `playing`, `paused` or `idle`. A source that goes idle clears its track fields |
+| `now_playing.bluetooth` | `duration` and `position` in milliseconds when the phone reports them; `device` is the phone's MAC |
+| `amp` | `null` before pairing |
+| `amp.last_result`, `devices[].last_result` | the most recent connect or disconnect attempt: `ok`, BlueZ's error name if it failed, and when |
+| `phones.pairing` | `until` is when the window closes; `last_paired` is the MAC of the last phone paired in it |
+| `network.link` | `wifi` or `ethernet`. `ssid` and `signal` (0–100) are `null` on Ethernet |
+| `network.change`, `node.update` | progress of a Wi-Fi change or an update; see below |
+
+**No volume.** speakerd has no volume control. Volume follows the sender: the phone or
+Mac sets it, and it reaches the Kohler over AVRCP. The amp has no absolute volume, so a
+level can't be set from outside. A relative step may come later.
+
+### `POST /amp/scan`, `GET /amp/found`
+
+- `POST /amp/scan`, body `{"seconds": 20}` (at most 30). `202` → `{"ok": true}`, or
   `409 busy` if a scan or pair is already running.
-- `GET /bt/found` returns:
+- `GET /amp/found` returns:
 
   ```json
   {"scanning": true,
@@ -187,58 +298,151 @@ Same `mqtt` object as `/claim`. Replaces the login and restarts speakerd. `200` 
   `likely_amp` marks a device that advertises as an audio sink. It's only a hint for
   sorting the list; the user still picks.
 
-### `POST /bt/pair`
+### `POST /amp/pair`
 
 - Body: `{"mac": "F4:4E:FD:00:00:00"}`. The user must first put the amp in pairing mode.
-- **Effect:** pair, trust, connect, write `amp_mac` and `amp_name` into speakerd's
-  config, and restart speakerd.
+- **Effect:** pair, trust and connect, then store the amp in speakerd's config. No
+  restart.
 - **The Kohler needs a PIN** (confirmed 2026-09-28). It uses legacy PIN pairing with the
-  fixed PIN `0000`. The node's agent must answer BlueZ's `RequestPinCode` with it. A
+  fixed PIN `0000`. speakerd's agent answers BlueZ's `RequestPinCode` with it. A
   NoInputNoOutput agent fails with `org.bluez.Error.AuthenticationFailed`.
 - `200` → `{"ok": true}`, or `502 pair_failed` with the BlueZ error in `message`.
 - **Pairing mode on the Kohler** (tested 2026-09-29): the amp has no pairing button.
   Pairing mode started on the Anthem+ screen works. Removing a device on the screen
-  unpairs **every** device, not just that one. Whether the amp can be paired
-  without the screen, for example after a power cycle, is not yet known.
+  unpairs **every** device, not just that one. Whether the amp can be paired without
+  the screen, for example after a power cycle, is not yet known.
 
-### `POST /bt/connect`, `POST /bt/disconnect`, `POST /bt/forget`
+### The other amp commands
 
-- **connect / disconnect:** connect or disconnect the paired amp. Disconnect is
-  deliberate: speakerd's auto-reconnect stays off until the next connect, the same rule
-  as the Home Assistant switch. Both return `{"ok": true}` or `502 failed`.
-- **forget:** removes the pairing and clears `amp_mac`. speakerd keeps running, with no
-  amp.
+- **connect / disconnect:** disconnect is deliberate. Auto-reconnect stays off until the
+  next connect, the same rule as Home Assistant's switch. `502 failed` if BlueZ refuses.
+- **reconnect:** disconnect, wait, connect. Any phone stays connected throughout.
+- **auto-reconnect:** whether speakerd reconnects the amp when it drops. It's stored, so
+  it survives a reboot.
+- **forget:** removes the pairing and clears the amp from the config. speakerd keeps
+  running with no amp.
+
+### Phones
+
+- **`POST /phones/pairing`,** body `{"seconds": 120}` to open (at most 300) or
+  `{"open": false}` to close.
+  - While it's open, the node is discoverable as "Bluetooth <name>", and speakerd's agent
+    accepts a phone that pairs.
+  - Each new phone shows in `phones.pairing.last_paired` and in `phones.devices`.
+  - The window closes by itself at `until`.
+- **connect, disconnect, forget:** for a phone in `phones.devices`. `404 not_found` for
+  an unknown MAC.
+- **Phones stay connected** together with the amp. Their audio is mixed, and the amp's
+  screen shows the most recent sender.
+- `GET /info` reports `phones`: `onboard` (version A, the Pi's own radio) or `dongle`
+  (version B, a USB dongle for range).
+
+### `PUT /node/name`
+
+- Body `{"name": "Bathroom Speaker"}`, 1–40 characters, with no quotes, backslashes,
+  `/` or `&`.
+- Renames the AirPlay receiver, the Bluetooth name and the zeroconf instance. The `id`
+  and `mac` never change.
+- shairport-sync restarts, so AirPlay drops for a few seconds.
+
+### `POST /node/reboot`, `POST /node/shutdown`
+
+- `202` → `{"ok": true}`, then the node goes down about two seconds later, so the reply
+  gets out first.
+- They run through logind with the polkit rule below. They aren't stored or queued, so
+  a stale request can never repeat after a reboot.
+
+### `POST /node/update`
+
+- Body: `{"version": "0.0.3", "sha256": "<64 hex>"}`, from the pin in Home Assistant's
+  integration.
+- `202` → `{"ok": true}`. Progress shows in `node.update`, and a client follows it like
+  any other change.
+- `409 busy` if an install or update is already running.
+- `409 downgrade` if `version` is lower than the installed one. The same version is
+  allowed and reinstalls it, as a repair.
+
+**How it works:**
+1. speakerd writes the request to `/var/lib/nowairplaying/update/request.json`.
+2. speakerd starts the fixed system unit `nowairplaying-update.service`. A polkit rule
+   lets `nowairplaying` start that one unit and nothing else.
+3. The unit runs as root.
+   - It reads the request and checks `version` against `N.N.N` and `sha256` against 64
+     lowercase hex characters.
+   - **It builds the URL itself:** our GitHub release asset for that version. The URL
+     isn't part of the request, so a stolen token can install only a release we
+     published.
+   - It runs the same bootstrap as the first install, with the `--user`, `--name` and
+     `--phones` recorded then.
+4. `install.json` tracks it like any install. `node.update` mirrors it:
+   `state` (`idle`, `running`, `done` or `failed`), `version`, `phase_name`, `reason`
+   and `message`.
+5. **Rollback.** The previous release stays unpacked in `/opt/nowairplaying/<old ver>`.
+   If the new one fails its verify step, the unit reinstalls the old one. It then
+   reports `failed` with `rolled_back: true`.
+
+speakerd restarts during an update, so the SSE stream drops. The client reconnects and
+reads the outcome from `node.update`.
+
+**Home Assistant's Update entity** compares `node.version` with the integration's pin.
+Installing calls this endpoint.
+
+### `POST /wifi`
+
+- Body: `{"ssid": "Home", "psk": "…", "hidden": false}`. `psk` may be omitted for an open
+  network. `202` → `{"ok": true}`.
+- **Effect:**
+  1. speakerd adds a NetworkManager connection for the new network and activates it. The
+     old connection is kept.
+  2. Within 60 seconds the node must get an address and reach its gateway.
+  3. **If it does,** the new connection becomes the preferred one, and the old one is
+     kept as a fallback.
+  4. **If it doesn't,** the node switches back to the old connection and deletes the new
+     one.
+- Wi-Fi is the node's only link, and it has no screen, so rollback is the default.
+- `network.change.state` goes `testing`, then `done` or `rolled_back`, with `reason`
+  (`no_address`, `no_gateway`, `auth_failed` or `not_found`).
+- **The connection drops during the test.** If the new network is a different LAN,
+  Home Assistant finds the node again through zeroconf, which is keyed by `mac`.
+- The node never returns the password, and never logs it.
+- On an Ethernet node it returns `409 no_wifi`.
 
 ### `GET /verify`
 
 ```json
 {"ok": false,
  "checks": [
-   {"id": "bluez_version", "ok": true, "detail": "bluetoothd 5.87"},
+   {"id": "bluez_version", "ok": true, "detail": "bluetoothd 5.82"},
    {"id": "pipewire_version", "ok": true, "detail": "1.4.2"},
    {"id": "amp_connected", "ok": false, "detail": "not connected"}
  ]}
 ```
 
-Check ids are stable; Home Assistant raises a repair issue when one that passed starts
-failing. All of them check the **running** system, not the installed packages:
+Check ids are stable. All checks test the **running** system, not the installed
+packages:
 
 | id | Passes when |
 |---|---|
-| `bluez_version` | the running `bluetoothd` is 5.87 |
-| `pipewire_version` | PipeWire ≥ 1.4 runs in the node user's session |
-| `wireplumber_version` | WirePlumber ≥ 0.5.8 runs in the node user's session |
-| `packages_held` | PipeWire, WirePlumber and the NowAirPlaying packages are apt-held |
+| `bluez_version` | the running `bluetoothd` is at least 5.82 |
+| `pipewire_version` | PipeWire 1.4 or later runs in `nowairplaying`'s session |
+| `wireplumber_version` | WirePlumber 0.5.8 or later runs in `nowairplaying`'s session |
+| `packages_held` | the NowAirPlaying packages (nqptp, shairport-sync) are apt-held |
 | `shairport_airplay2` | shairport-sync runs and `-V` contains `-AirPlay2-` |
-| `shairport_dbus` | `org.gnome.ShairportSync` is owned on the node user's session bus |
+| `shairport_dbus` | `org.gnome.ShairportSync` is owned on `nowairplaying`'s session bus |
 | `no_mpris` | no `org.mpris.MediaPlayer2.*` player is on the session or system bus, and `mpris-proxy` isn't running |
 | `nqptp_active` | `nqptp.service` is active |
 | `mdns` | `avahi-daemon` runs and `/etc/nsswitch.conf` has `mdns4_minimal` |
+| `polkit_rules` | `/etc/polkit-1/rules.d/50-nowairplaying.rules` is present and matches the release |
 | `speakerd_running` | the speakerd user service is active |
 | `amp_paired` | the configured amp is paired and trusted |
 | `amp_connected` | the amp is connected |
 | `amp_player` | exactly one player, speakerd's `/org/speakerd/player`, is registered on the amp's adapter |
-| `mqtt_connected` | claimed nodes only: speakerd is connected to the broker |
+| `mqtt_connected` | only when MQTT is configured: speakerd is connected to the broker |
+
+**Which checks raise a repair** (agreed 2026-09-30): only a check that passed before and
+then fails several runs in a row. That covers AirPlay 2, PipeWire, nqptp, mDNS,
+speakerd and the polkit rules. "Amp not paired" raises one too. `amp_connected`, the
+player and MQTT only show on the card, since a sleeping amp is normal.
 
 ### Errors
 
@@ -246,55 +450,70 @@ Every error is JSON: `{"error": "<code>", "message": "<human text>"}`.
 
 | HTTP | `error` | When |
 |---|---|---|
-| 400 | `bad_request` | missing or invalid field |
-| 401 | `unauthorized` | token missing or wrong on a claimed node |
-| 404 | `not_found` | no such endpoint, or no paired amp for connect or disconnect |
+| 400 | `bad_request` | a field is missing or invalid |
+| 401 | `unauthorized` | the token is missing or wrong on a claimed node |
+| 403 | `https_required` | a token was sent over HTTP, or `/claim` was called over HTTP |
+| 403 | `claim_required` | a **token** endpoint on an unclaimed node |
+| 404 | `not_found` | no such endpoint, no paired amp, or an unknown phone |
 | 409 | `already_claimed` | `/claim` on a claimed node |
-| 409 | `busy` | a scan or pair is already running |
-| 502 | `pair_failed`, `failed` | BlueZ or systemd refused. `message` carries its error. |
+| 409 | `busy` | a scan, pair, update or Wi-Fi change is already running |
+| 409 | `downgrade` | `/node/update` to an older version |
+| 409 | `no_wifi` | `/wifi` on an Ethernet node |
+| 502 | `pair_failed`, `failed` | BlueZ, NetworkManager or systemd refused. `message` carries its error |
+
+## Privileges
+
+The install runs as root once. It adds one rules file,
+`/etc/polkit-1/rules.d/50-nowairplaying.rules`. After that, **nothing of ours runs as
+root**: root system services act for `nowairplaying` on exactly these actions, and on
+nothing else.
+
+| Action | For |
+|---|---|
+| `org.freedesktop.NetworkManager.settings.modify.system`, `org.freedesktop.NetworkManager.network-control` | `/wifi` |
+| `org.freedesktop.systemd1.manage-units`, only with `unit` = `nowairplaying-update.service` and `verb` = `start` | `/node/update` |
+| `org.freedesktop.login1.reboot`, `org.freedesktop.login1.power-off`, and their `-multiple-sessions` variants | `/node/reboot`, `/node/shutdown` |
+
+- **Stock trixie's NetworkManager rule doesn't cover us.** It allows only a local,
+  active session of a `sudo` or `netdev` user. A background service has neither, so we
+  ship our own rule.
+- **The rules name only the `nowairplaying` account.** The login user and anything the
+  owner runs gets nothing new from them.
+- **OS updates aren't done from Home Assistant.** The install turns on Debian's
+  `unattended-upgrades` for security updates. Our two packages are apt-held, so those
+  updates never replace them.
+
+## MQTT
+
+- **For nodes without Home Assistant.** It's set by hand in `config.toml` (`[mqtt]`), as
+  in speakerd today.
+- **On a claimed node,** speakerd removes its retained discovery with empty publishes,
+  and stops publishing discovery. Someone who runs a broker as well doesn't get a second
+  device card. State topics carry on, for anyone's own automations.
+- **The API never reads or writes MQTT settings,** and Home Assistant never needs them.
 
 ## The setup page
 
-At `http://<hostname>.local/` the node serves one plain page with no
-framework, which calls the endpoints above:
+At `http://<hostname>.local:8080/` the node serves one plain page with no framework.
+It calls the endpoints above with no token:
 
-1. **Status:** name, amp connected or not, and the verify checks as green or red.
-2. **Pair the amplifier:** "Put the amplifier in pairing mode, then press Scan" → a list
-   with likely amps first → pick one → Pair → result.
-3. **Amplifier:** Connect, Disconnect and Forget buttons.
-4. **When claimed:** "Managed by Home Assistant at `<host>`". Status, Connect and
-   Disconnect stay; the other controls are hidden.
+1. **Status:** name, whether the amp is connected, and the verify checks as green or red.
+2. **Pair the amplifier:** "Put the amplifier in pairing mode, then press Scan", then a
+   list with likely amps first. The user picks one, presses Pair, and sees the result.
+3. **Amplifier:** Connect, Disconnect, Reconnect and Forget buttons.
+4. **Phones:** "Let a phone pair (2 minutes)", the phone list, and Connect, Disconnect
+   and Forget buttons.
+5. **When claimed:** "Managed by Home Assistant at `<host>`". Status and amp
+   Connect/Disconnect stay; every other control is hidden.
 
-## Why HTTP, not HTTPS
-
-- **The setup page needs HTTP.** A node can only offer HTTPS with a self-signed
-  certificate, and every phone and browser shows a full-screen security warning for
-  one. For a beginner's first contact with the device, that is the wrong message.
-- **The Home Assistant integration is unaffected either way.** It calls the node from
-  HA's server side, not from the browser, so whether HA itself is served over http or
-  https makes no difference.
-- **The exposure matches what is already there.** The MQTT password crosses the home
-  network once, in `/claim`. MQTT itself then runs as plain MQTT on port 1883, the
-  Mosquitto add-on's default, which sends the same login in the clear on every
-  connect.
-- **Possible later upgrade:** HTTPS for the API only, with the certificate fingerprint
-  in the zeroconf TXT record for Home Assistant to pin. The page stays HTTP. Not
-  planned for v1.
+**Why the page is HTTP:** a node can only offer HTTPS with a self-signed certificate,
+and every phone and browser shows a full-screen warning for one. For a beginner's first
+contact with the device, that's the wrong message. The page never handles a token, so
+HTTP costs nothing there.
 
 ## Open questions
 
-These go to Home Assistant's integration owner:
+1. **For Home Assistant:** the certificate-change repair (re-claim through the reset
+   file). Is that acceptable, or should there be a re-pin flow over SSH?
 
-1. ~~`_nowairplaying._tcp` as the service type, and `mac` as the `unique_id`~~: agreed
-   2026-09-30. The TXT fields are final for API v1. `mac` is always the onboard adapter
-   (`hci0`), and `"phones"` (`onboard` or `dongle`) goes in `GET /info`.
-2. Deleting the config entry calls `POST /release`. If the node is unreachable at that
-   moment, the entry is still removed, and the reset file is the fallback. Acceptable?
-3. Should the integration rotate the MQTT login via `POST /mqtt`, or is one login per
-   claim enough?
-4. **Answered 2026-09-30:** only a check that used to pass and then fails several runs
-   in a row raises a repair: AirPlay 2, PipeWire, nqptp, mDNS, speakerd. So does
-   "amp not paired". `amp_connected`, the player and MQTT show on the card only. The
-   original question: which `/verify` check ids should raise a repair issue, and which should only show on
-   the device page? `amp_connected` probably shouldn't raise one, since a sleeping amp
-   is normal.
+**Settled:** the setup page is at `:8080` (the owner, 2026-10-02).

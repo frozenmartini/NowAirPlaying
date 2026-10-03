@@ -60,7 +60,7 @@ Phase 6 must catch these, because each of them fails silently:
   `org.mpris.MediaPlayer2.ShairportSync` is owned on no bus.
 
 Some steps can't be scripted, so the installer stops and prints a checklist instead:
-pairing with the amplifier, and the MQTT login if Home Assistant is used. The Kohler
+pairing with the amplifier. The Kohler
 uses legacy PIN pairing with the fixed PIN **0000**. An agent that offers no PIN fails
 with "Authentication Failed".
 
@@ -110,9 +110,9 @@ That is the reference build minus two options:
 ## 3. Guided setup
 
 The node works without Home Assistant: its own setup page pairs the amplifier. When
-Home Assistant is present, its Kohler Anthem+ integration finds the node, hands it an
-MQTT login, pairs it with the amplifier, and runs the verify checks. Both use one small
-HTTP API on the node. The draft contract is
+Home Assistant is present, its Kohler Anthem+ integration claims the node, pairs it
+with the amplifier, and talks to it directly over HTTPS, with no MQTT (agreed
+2026-10-02). Both use one API on the node. The draft contract is
 [SETUP-API.md](SETUP-API.md).
 
 **Setup starts in Home Assistant (2026-09-28).** The rest of that journey is still
