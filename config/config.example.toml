@@ -1,9 +1,11 @@
-# speakerd configuration. Copy to ~/.config/speakerd/config.toml and chmod 600.
-# With MQTT on, the real file holds the MQTT password: never commit it.
+# speakerd configuration. The installer copies it to the nowairplaying
+# account's ~/.config/speakerd/config.toml, mode 600. With MQTT on, the real
+# file holds the MQTT password: never commit it.
 #
-# The only required section is [bluetooth]. Without [mqtt] the node runs
-# standalone: AirPlay plays and the amp's screen shows what's playing, with
-# no broker and no Home Assistant.
+# The only required section is [bluetooth]. Home Assistant talks to the node
+# through the node API (docs/SETUP-API.md), not MQTT: a separate service,
+# nowairplaying-api, which reaches speakerd over [control]'s socket. [mqtt] is
+# for people without Home Assistant who want the node on their own broker.
 
 # [node]: identity of this node. Optional; everything defaults from
 # mqtt.base_topic. Give each node on the same broker its own id, base_topic
@@ -16,8 +18,9 @@
 #name = "Kitchen Speaker"    # default: id, underscores -> spaces, title-cased
 #area = "Kitchen"            # optional; only honoured when HA first creates the device
 
-# [mqtt]: optional, for Home Assistant. speakerd is the node's only MQTT
-# client; shairport-sync never talks to the broker.
+# [mqtt]: optional, set by hand. speakerd is the node's only MQTT client;
+# shairport-sync never talks to the broker. While Home Assistant has claimed
+# the node over the API, speakerd publishes no MQTT discovery.
 #[mqtt]
 #enabled = true               # false keeps the section but runs standalone
 #host = "homeassistant.local"
@@ -31,7 +34,10 @@
 
 [bluetooth]
 adapter = "hci0"
-amp_mac = "00:00:00:00:00:00"  # your Kohler amplifier's Bluetooth address
+# The amp is normally paired over the node API (Home Assistant or the setup
+# page), which stores it in state_file. This line only seeds it; the
+# placeholder means none.
+amp_mac = "00:00:00:00:00:00"
 amp_name = "Kohler Amplifier"
 fix_metadata_delay_s = 3     # disconnect amp -> sleep -> connect amp
 streaming_debounce_s = 2     # falling-edge filter for transport-state flaps
@@ -44,9 +50,8 @@ amp_metadata_export = true
 #amp_export_raw_log = "~/.local/state/speakerd/amp_export-raw.log"
 
 # Amp auto-reconnect: when the amp's link drops unexpectedly (or is down
-# after boot), speakerd reconnects it. Gated by the discovered HA switch
-# "Auto Reconnect <amp_name>" (persisted in state_file below). The final
-# failure lands on <base_topic>/device/amp/result.
+# after boot), speakerd reconnects it. Switched by PUT /api/v2/amp/auto-reconnect
+# or the MQTT switch "Auto Reconnect <amp_name>" (persisted in state_file below).
 amp_reconnect_debounce_s = 5     # wait after a drop before acting
 amp_reconnect_retry_delay_s = 10 # pause between failed attempts
 amp_reconnect_tries = 3          # attempts per outage before giving up
@@ -57,13 +62,23 @@ enabled = true               # follow shairport-sync over D-Bus (org.gnome.Shair
 
 [system]
 # true = subscribe to <base_topic>/system/{reboot,shutdown} (payload PRESS,
-# result JSON on system/result) and run `sudo -n systemctl reboot|poweroff`.
-# Requires passwordless sudo for systemctl.
+# result JSON on system/result) and run `systemctl reboot|poweroff`. On a node
+# installed by install.sh this account has no right to: only the API
+# service's account does (its /node/reboot). For hand-made setups only.
 power_commands = false
-state_file = "~/.local/state/speakerd/state.json"  # persists the auto-reconnect gate
+# persists the auto-reconnect gate, the paired amp and the node name
+state_file = "~/.local/state/speakerd/state.json"
 
-# Phones that stream to the node over Bluetooth: an optional add-on (AirPlay
-# needs no pairing). One block per phone; none is fine.
+# [control]: the local socket the node API service (nowairplaying-api) uses
+# for everything Bluetooth and AirPlay. Its directory is the API account's
+# group, so nothing else can connect.
+[control]
+enabled = true
+#socket = "/run/nowairplaying/speakerd.sock"
+#shairport_conf = "~/.config/shairport-sync.conf"   # rewritten by a rename
+
+# Phones with their own MQTT switch. Not needed for the API: every phone
+# paired in the pairing window shows up there without a block here.
 #[[devices]]
 #name = "My iPhone"
 #slug = "my_iphone"

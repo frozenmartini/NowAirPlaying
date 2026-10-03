@@ -1,0 +1,18 @@
+# System unit: joins the Wi-Fi network dropped on the boot partition before
+# first boot, for the case install/wifi-add.sh's other caller (Home
+# Assistant over SSH, docs/SETUP-API.md "POST /wifi") can't reach yet --
+# there's no SSH session, and no screen, until the node is on some network.
+# Runs once per dropped file; wifi-add.sh deletes it, so a stale file from
+# an earlier boot never repeats.
+[Unit]
+Description=NowAirPlaying: join the Wi-Fi network from the boot partition
+ConditionPathExists=/boot/firmware/nowairplaying-wifi.txt
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nowairplaying/wifi-add.sh --file /boot/firmware/nowairplaying-wifi.txt --delete
+
+[Install]
+WantedBy=multi-user.target

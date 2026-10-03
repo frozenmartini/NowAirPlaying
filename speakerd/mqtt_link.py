@@ -47,6 +47,7 @@ class MqttLink:
         c.on_disconnect = self._on_disconnect
         c.on_message = self._on_message
         self._client = c
+        self.connected = False  # written by paho's thread, read for /verify
 
     def start(self) -> None:
         self._client.connect_async(self._cfg.host, self._cfg.port, keepalive=30)
@@ -77,11 +78,13 @@ class MqttLink:
             log.error("MQTT connect failed rc=%s (%s)", rc, mqtt.connack_string(rc))
             return
         log.info("MQTT connected to %s:%s", self._cfg.host, self._cfg.port)
+        self.connected = True
         for topic, qos in self._subscriptions:
             client.subscribe(topic, qos=qos)
         self._loop.call_soon_threadsafe(self._queue.put_nowait, (EV_CONNECTED, None, None))
 
     def _on_disconnect(self, client, userdata, rc):
+        self.connected = False
         if rc != 0:
             log.warning("MQTT connection lost rc=%s, paho will reconnect", rc)
 
@@ -102,6 +105,7 @@ class NullMqttLink:
 
     def __init__(self, *args, **kwargs):
         self._subscriptions: list[tuple[str, int]] = []
+        self.connected = False
 
     def start(self) -> None:
         log.info("MQTT disabled in config — running standalone")

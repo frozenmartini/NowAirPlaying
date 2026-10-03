@@ -1,0 +1,18 @@
+# System unit, started on demand by the node API's POST /node/update
+# (nowairplaying-api.service), through the narrow polkit rule in
+# polkit/50-nowairplaying.rules (the only unit "nowairplaying-api" may
+# start). No [Install] section: it is never enabled, only started. The fixed
+# unit name means two updates can never run at once -- systemd refuses a
+# second unit with the same name.
+#
+# install/update.sh (docs/SETUP-API.md "POST /node/update",
+# docs/INSTALL-STATE.md "Rollback") reads /var/lib/nowairplaying/update/request.json,
+# builds the release URL itself (never from the request), runs the installed
+# bootstrap, and rolls back to the previous release on a failed verify.
+
+[Unit]
+Description=NowAirPlaying: install another release
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nowairplaying/update.sh

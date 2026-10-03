@@ -1,8 +1,9 @@
 """Configuration loading: TOML -> frozen dataclasses.
 
-Single source of truth for MQTT credentials and the device registry. MQTT is
-optional: without an [mqtt] section (or with enabled = false) the node runs
-standalone and only Home Assistant loses its view.
+Single source of truth for MQTT credentials and the static device registry.
+MQTT is optional: without an [mqtt] section (or with enabled = false) the node
+runs without a broker. The amp is optional too: a fresh node starts with none
+and gets one paired over the node API (roster.py keeps the live amp).
 MACs are canonicalized to uppercase colon form; the D-Bus underscore
 form is always derived, never stored (the old scripts' mixed formats
 were a live bug).
@@ -18,6 +19,7 @@ _MAC_RE = re.compile(r"^([0-9A-F]{2}:){5}[0-9A-F]{2}$")
 _SLUG_RE = re.compile(r"^[a-z0-9_]+$")
 
 AMP_SLUG = "amp"
+PLACEHOLDER_MAC = "00:00:00:00:00:00"
 
 
 class ConfigError(Exception):
@@ -64,7 +66,10 @@ class Config:
     announce_prefix: str
     # [bluetooth]
     adapter: str
-    amp: Device
+    # the amp from config.toml; None = none configured (the live amp is in
+    # roster.Roster, which a pair or forget over the API changes)
+    amp: Device | None
+    amp_name: str
     fix_metadata_delay_s: float
     streaming_debounce_s: float
     amp_reconnect_debounce_s: float
@@ -84,6 +89,11 @@ class Config:
     # [system]
     power_commands: bool
     state_file: str
+    # [control] — the control socket the node API service talks to
+    # (control.py; the API itself runs as its own account, apiserver.py)
+    control_enabled: bool
+    control_socket: str
+    shairport_conf: str
 
     by_slug: dict[str, Device] = field(default_factory=dict)
     by_mac: dict[str, Device] = field(default_factory=dict)
@@ -95,7 +105,7 @@ class Config:
 
     @property
     def all_devices(self) -> tuple[Device, ...]:
-        return self.ios_devices + (self.amp,)
+        return self.ios_devices + ((self.amp,) if self.amp else ())
 
     @property
     def ios_macs(self) -> set[str]:
@@ -164,12 +174,13 @@ def load(path: str) -> Config:
         seen_macs.add(dev.mac)
         devices.append(dev)
 
-    amp = Device(
-        name=str(b.get("amp_name", "Kohler Amplifier")),
-        slug=AMP_SLUG,
-        mac=_canon_mac(str(b["amp_mac"]), "bluetooth.amp_mac"),
-    )
-    if amp.mac in seen_macs:
+    amp_name = str(b.get("amp_name", "Kohler Amplifier"))
+    amp = None
+    if b.get("amp_mac"):
+        mac = _canon_mac(str(b["amp_mac"]), "bluetooth.amp_mac")
+        if mac != PLACEHOLDER_MAC:
+            amp = Device(name=amp_name, slug=AMP_SLUG, mac=mac)
+    if amp and amp.mac in seen_macs:
         raise ConfigError("amp_mac duplicates an iOS device MAC")
 
     tries = int(b.get("amp_reconnect_tries", 3))
@@ -177,6 +188,10 @@ def load(path: str) -> Config:
         raise ConfigError("amp_reconnect_tries must be >= 1")
 
     s = raw.get("system", {})
+    a = raw.get("control", {})
+
+    def path(table: dict, key: str, default: str) -> str:
+        return os.path.expanduser(str(table.get(key, default)))
 
     n = raw.get("node", {})
     base_topic = str(m.get("base_topic", "nowairplaying")).rstrip("/")
@@ -210,6 +225,7 @@ def load(path: str) -> Config:
         announce_prefix=str(m.get("announce_prefix", "speakerd/nodes")).strip("/"),
         adapter=str(b.get("adapter", "hci0")),
         amp=amp,
+        amp_name=amp_name,
         fix_metadata_delay_s=float(b.get("fix_metadata_delay_s", 3)),
         streaming_debounce_s=float(b.get("streaming_debounce_s", 2)),
         amp_reconnect_debounce_s=float(b.get("amp_reconnect_debounce_s", 5)),
@@ -221,6 +237,8 @@ def load(path: str) -> Config:
         ios_devices=tuple(devices),
         airplay_enabled=bool(raw.get("airplay", {}).get("enabled", False)),
         power_commands=bool(s.get("power_commands", False)),
-        state_file=os.path.expanduser(
-            str(s.get("state_file", "~/.local/state/speakerd/state.json"))),
+        state_file=path(s, "state_file", "~/.local/state/speakerd/state.json"),
+        control_enabled=bool(a.get("enabled", False)),
+        control_socket=path(a, "socket", "/run/nowairplaying/speakerd.sock"),
+        shairport_conf=path(a, "shairport_conf", "~/.config/shairport-sync.conf"),
     )

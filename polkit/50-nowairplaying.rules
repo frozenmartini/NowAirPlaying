@@ -1,0 +1,36 @@
+// NowAirPlaying: the nowairplaying-api account may do exactly these,
+// nothing else.
+//
+// Installed to /usr/share/polkit-1/rules.d/50-nowairplaying.rules by
+// install/install.sh (docs/SETUP-API.md, "Privileges") -- /usr/share, not
+// /etc, so the API's own verify check can read this file without root.
+//
+// nowairplaying-api is the ONLY polkit subject, and the only account named
+// here. The audio stack (shairport-sync, speakerd, PipeWire, ...) runs as a
+// separate account, "nowairplaying", which gets no grants at all: shairport-
+// sync listens to the whole LAN, so the account that can be reached from the
+// network must not also be the account that can trigger a reboot or an
+// update. Nothing of ours runs as root outside these two actions, each one
+// scoped to the single unit or action it needs.
+//
+// Wi-Fi (POST /wifi) no longer goes through polkit or NetworkManager's
+// system bus actions at all: install/wifi-add.sh and
+// systemd/nowairplaying-wifi.service run as root directly.
+polkit.addRule(function(action, subject) {
+    if (subject.user != "nowairplaying-api") return polkit.Result.NOT_HANDLED;
+
+    // POST /node/update: start exactly this one fixed unit, nothing else.
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "nowairplaying-update.service" &&
+        action.lookup("verb") == "start")
+        return polkit.Result.YES;
+
+    // POST /node/reboot, POST /node/shutdown.
+    if (action.id == "org.freedesktop.login1.reboot" ||
+        action.id == "org.freedesktop.login1.reboot-multiple-sessions" ||
+        action.id == "org.freedesktop.login1.power-off" ||
+        action.id == "org.freedesktop.login1.power-off-multiple-sessions")
+        return polkit.Result.YES;
+
+    return polkit.Result.NOT_HANDLED;
+});

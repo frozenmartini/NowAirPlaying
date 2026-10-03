@@ -42,22 +42,22 @@ def make_app(tmp):
 
 async def test_system_command(tmp):
     app = make_app(tmp)
-    log = os.path.join(tmp, "sudo.log")
-    os.environ["FAKE_SUDO_LOG"] = log
+    log = os.path.join(tmp, "systemctl.log")
+    os.environ["FAKE_SYSTEMCTL_LOG"] = log
     # success path
     await app._system_command("reboot")
     topic, payload, retain = app.mqtt.published[-1]
     r = json.loads(payload)
     assert topic.endswith("system/result") and retain, (topic, retain)
     assert r["action"] == "reboot" and r["ok"] is True and r["error"] is None, r
-    assert "systemctl reboot" in open(log).read()
+    assert "--no-ask-password reboot" in open(log).read()
     # failure path
-    os.environ["FAKE_SUDO_FAIL"] = "1"
+    os.environ["FAKE_SYSTEMCTL_FAIL"] = "1"
     await app._system_command("shutdown")
     r = json.loads(app.mqtt.published[-1][1])
     assert r["ok"] is False and "simulated systemctl failure" in r["error"], r
-    os.environ.pop("FAKE_SUDO_FAIL")
-    assert "systemctl poweroff" in open(log).read()
+    os.environ.pop("FAKE_SYSTEMCTL_FAIL")
+    assert "--no-ask-password poweroff" in open(log).read()
     print("system_command: PASS")
 
 async def test_auto_reconnect_policy(tmp):
@@ -643,9 +643,10 @@ async def test_standalone_config(tmp):
 
 
 async def main():
-    # expose fake-sudo.sh as `sudo` ahead of the real one, so no manual PATH setup is needed
+    # expose fake-systemctl.sh as `systemctl` ahead of the real one, so no manual
+    # PATH setup is needed
     with tempfile.TemporaryDirectory() as fake_bin:
-        os.symlink(os.path.join(HERE, "fake-sudo.sh"), os.path.join(fake_bin, "sudo"))
+        os.symlink(os.path.join(HERE, "fake-systemctl.sh"), os.path.join(fake_bin, "systemctl"))
         os.environ["PATH"] = fake_bin + os.pathsep + os.environ["PATH"]
         for test in (test_system_command, test_auto_reconnect_policy, test_retry_exhaustion,
                      test_system_qos0, test_discovery_qos_and_cleanup, test_success_race,

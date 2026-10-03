@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 
 from . import __version__
-from .config import Config
+from .config import AMP_SLUG, Config
 
 ANNOUNCE_SCHEMA = 1
 
@@ -57,7 +57,7 @@ def build_discovery(cfg: Config) -> list[tuple[str, str]]:
     }))
 
     entities.append(("switch", "amp_auto_reconnect", {
-        "name": f"Auto Reconnect {cfg.amp.name}",
+        "name": f"Auto Reconnect {cfg.amp_name}",
         "icon": "mdi:autorenew",
         "state_topic": cfg.topic("amp", "auto_reconnect"),
         "command_topic": cfg.topic("amp", "auto_reconnect", "set"),
@@ -191,13 +191,13 @@ def build_announce(cfg: Config) -> tuple[str, str]:
         topics["system_shutdown"] = cfg.topic("system", "shutdown")
         topics["system_result"] = cfg.topic("system", "result")
 
-    def roster_entry(dev) -> dict:
+    def roster_entry(slug: str, name: str) -> dict:
         return {
-            "slug": dev.slug,
-            "name": dev.name,
-            "connected_topic": cfg.topic("device", dev.slug, "connected"),
-            "command_topic": cfg.topic("device", dev.slug, "set"),
-            "result_topic": cfg.topic("device", dev.slug, "result"),
+            "slug": slug,
+            "name": name,
+            "connected_topic": cfg.topic("device", slug, "connected"),
+            "command_topic": cfg.topic("device", slug, "set"),
+            "result_topic": cfg.topic("device", slug, "result"),
         }
 
     payload = {
@@ -224,7 +224,7 @@ def build_announce(cfg: Config) -> tuple[str, str]:
         "topics": topics,
         # the amp is commandable on device/amp/set like any device, but it is
         # discovered as a binary_sensor, not a switch
-        "amp": roster_entry(cfg.amp),
-        "devices": [roster_entry(d) for d in cfg.ios_devices],
+        "amp": roster_entry(AMP_SLUG, cfg.amp_name),
+        "devices": [roster_entry(d.slug, d.name) for d in cfg.ios_devices],
     }
     return cfg.announce_topic, json.dumps(payload, separators=(",", ":"))

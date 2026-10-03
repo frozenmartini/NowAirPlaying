@@ -1,11 +1,12 @@
-"""speakerd entry point: wires BlueZ engine + shairport D-Bus link + MQTT link + HA discovery."""
+"""speakerd entry point: wires BlueZ engine + shairport D-Bus link + MQTT link + HA
+discovery, and the control socket for the node API service (node.py,
+control.py) when [control] is enabled."""
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
 import logging
-import os
 import signal
 import sys
 from collections import defaultdict
@@ -18,7 +19,9 @@ from .bluez import BluezEngine
 from .config import AMP_SLUG, Config
 from .discovery import build_announce, build_discovery
 from .mqtt_link import EV_CONNECTED, EV_MESSAGE, MqttLink, NullMqttLink
+from .roster import Roster, load_state, update_state
 from .shairport import ShairportLink
+from .system import power
 
 log = logging.getLogger("speakerd")
 
@@ -44,18 +47,8 @@ def _load_auto_reconnect(path: str, default: bool = True) -> bool:
 
 
 def _save_auto_reconnect(path: str, enabled: bool) -> None:
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"amp_auto_reconnect": enabled}, f)
-            f.flush()
-            os.fsync(f.fileno())  # survive a power cut right after the toggle
-        os.replace(tmp, path)
-    except OSError as e:
-        log.warning("could not persist state to %s: %s", path, e)
+    # merged into the state file, which also holds the amp and the node name
+    update_state(path, amp_auto_reconnect=enabled)
 
 
 class App:
@@ -64,7 +57,8 @@ class App:
     def __init__(self, cfg: Config, loop: asyncio.AbstractEventLoop):
         self.cfg = cfg
         self.queue: asyncio.Queue = asyncio.Queue()
-        self.engine = BluezEngine(cfg, sink=self)
+        self.roster = Roster(cfg)
+        self.engine = BluezEngine(cfg, sink=self, roster=self.roster)
         self.airplay = AirplayState()
         # AirPlay state and commands travel over shairport's own D-Bus
         # interface, never MQTT: the amp screen must not depend on a broker
@@ -80,6 +74,12 @@ class App:
         self._bt_streaming = False
         self._discovery = build_discovery(cfg)
         self._announce = build_announce(cfg)
+        # off while Home Assistant has claimed the node over the API: HA owns
+        # the device card then, and a broker user must not get a second one.
+        # Remembered across restarts, so a restart never flashes a card in HA
+        # before the API service reconnects and confirms it
+        self._mqtt_discovery = bool(load_state(cfg.state_file).get("mqtt_discovery", True))
+        self._last_results: dict[str, dict] = {}  # slug -> last connect result
         self._tasks: set[asyncio.Task] = set()
 
         # amp auto-reconnect policy (HA-gated; see _maybe_auto_reconnect_amp)
@@ -113,6 +113,11 @@ class App:
         link = MqttLink if cfg.mqtt_enabled else NullMqttLink
         self.mqtt = link(cfg, loop, self.queue, subscriptions)
 
+        self.node = None
+        if cfg.control_enabled:
+            from .node import AudioNode
+            self.node = AudioNode(self)
+
     def _spawn(self, coro) -> asyncio.Task:
         # keep a strong reference: the loop only holds weak refs to tasks
         task = asyncio.get_running_loop().create_task(coro)
@@ -129,12 +134,89 @@ class App:
     def republish_all(self) -> None:
         """On every MQTT (re)connect and on HA birth."""
         self.mqtt.publish(self.cfg.availability_topic, "online", retain=True)
-        # the node announcement goes out before the entities it describes
-        self.mqtt.publish(self._announce[0], self._announce[1], retain=True)
-        for topic, payload in self._discovery:
-            self.mqtt.publish(topic, payload, retain=True)
+        if self._mqtt_discovery:
+            # the node announcement goes out before the entities it describes
+            self.mqtt.publish(self._announce[0], self._announce[1], retain=True)
+            for topic, payload in self._discovery:
+                self.mqtt.publish(topic, payload, retain=True)
         for topic, payload in self._retained.items():
             self.mqtt.publish(topic, payload, retain=True)
+
+    def set_mqtt_discovery(self, enabled: bool) -> None:
+        """Off on a claim, on again on release. Off clears what was published
+        with empty retained payloads, so no ghost entities remain."""
+        if enabled == self._mqtt_discovery:
+            return
+        self._mqtt_discovery = enabled
+        update_state(self.cfg.state_file, mqtt_discovery=enabled)
+        if enabled:
+            log.info("MQTT discovery on (not claimed by Home Assistant)")
+            self.republish_all()
+            return
+        log.info("MQTT discovery off (claimed by Home Assistant) — clearing it")
+        self.mqtt.publish(self._announce[0], "", retain=True)
+        for topic, payload in self._discovery:
+            if payload:
+                self.mqtt.publish(topic, "", retain=True)
+
+    # node API view -------------------------------------------------------------
+
+    def _changed(self) -> None:
+        if self.node is not None:
+            self.node.changed()
+
+    @property
+    def amp_connected(self) -> bool:
+        return self._amp_connected
+
+    @property
+    def auto_reconnect(self) -> bool:
+        return self._auto_reconnect
+
+    @property
+    def bt_streaming(self) -> bool:
+        return self._bt_streaming
+
+    @property
+    def bt_now_playing(self) -> dict:
+        return self._bt_now_playing
+
+    @property
+    def source(self) -> str:
+        bt, ap = self._bt_streaming, self._airplay_active()
+        return "both" if (bt and ap) else "bluetooth" if bt else "airplay" if ap else "idle"
+
+    def last_result(self, slug: str) -> dict | None:
+        return self._last_results.get(slug)
+
+    def _record_result(self, slug: str, action: str, ok: bool, err: str | None,
+                       **extra) -> None:
+        ts = _now_iso()
+        self._last_results[slug] = {"ok": ok, "error": err, "at": ts}
+        self._publish_retained(
+            self.cfg.topic("device", slug, "result"),
+            json.dumps({"action": action, "ok": ok, "error": err, **extra, "ts": ts}))
+        self._changed()
+
+    async def amp_command(self, action: str) -> tuple[bool, str | None]:
+        """The API's amp connect / disconnect / reconnect."""
+        if action == "reconnect":
+            return await self._fix_metadata()
+        return await self._device_command(AMP_SLUG, action)
+
+    def set_auto_reconnect(self, enabled: bool) -> None:
+        self._set_auto_reconnect(enabled)
+        self._changed()
+
+    def amp_roster_changed(self) -> None:
+        """The API paired or forgot the amp."""
+        if self.roster.amp is None:
+            if self._amp_reconnect_task is not None:
+                self._amp_reconnect_task.cancel()
+            self._amp_connected = False
+            self._last_results.pop(AMP_SLUG, None)
+            self._publish_retained(self.cfg.topic("device", AMP_SLUG, "connected"), "OFF")
+        self._changed()
 
     # BluezEngine sink interface -------------------------------------------
 
@@ -148,17 +230,28 @@ class App:
                 self._amp_user_disconnected = False
             else:
                 self._maybe_auto_reconnect_amp()
+        self._changed()
 
     def streaming_changed(self, on: bool) -> None:
         log.info("bluetooth streaming: %s", on)
         self._bt_streaming = on
         self._publish_retained(self.cfg.topic("bt", "streaming"), "ON" if on else "OFF")
         self._publish_source()
+        self._changed()
 
     def now_playing_changed(self, payload: dict) -> None:
         self._bt_now_playing = payload
         self._publish_retained(self.cfg.topic("bt", "now_playing"), json.dumps(payload))
         self._update_amp_export()
+        self._changed()
+
+    def devices_changed(self) -> None:
+        if self.node is not None:
+            self.node.devices_changed()
+
+    def bluez_ready(self) -> None:
+        if self.node is not None:
+            self._spawn(self.node.bluez_ready())
 
     # ----------------------------------------------------------------------
 
@@ -166,9 +259,7 @@ class App:
         return self.cfg.airplay_enabled and self.airplay.status != "idle"
 
     def _publish_source(self) -> None:
-        bt, ap = self._bt_streaming, self._airplay_active()
-        source = "both" if (bt and ap) else "bluetooth" if bt else "airplay" if ap else "idle"
-        self._publish_retained(self.cfg.topic("source"), source)
+        self._publish_retained(self.cfg.topic("source"), self.source)
 
     def _airplay_changed(self, snapshot: dict) -> None:
         """ShairportLink callback: a shairport-sync property changed."""
@@ -180,6 +271,7 @@ class App:
                                json.dumps(self.airplay.now_playing()))
         self._publish_source()
         self._update_amp_export()
+        self._changed()
 
     # ------------------------------------------------- amp metadata export
 
@@ -228,7 +320,7 @@ class App:
 
     # ---------------------------------------------------------- commands
 
-    async def _device_command(self, slug: str, action: str) -> None:
+    async def _device_command(self, slug: str, action: str) -> tuple[bool, str | None]:
         async with self._locks[slug]:
             if slug == AMP_SLUG:
                 # record intent under the lock, at execution time: a deliberate
@@ -240,25 +332,23 @@ class App:
                 ok, err = await self.engine.connect_device(slug)
             else:
                 ok, err = await self.engine.disconnect_device(slug)
-        self._publish_retained(
-            self.cfg.topic("device", slug, "result"),
-            json.dumps({"action": action, "ok": ok, "error": err, "ts": _now_iso()}))
+        self._record_result(slug, action, ok, err)
         if slug == AMP_SLUG:
             # a drop edge that landed while we held the lock was suppressed;
             # re-evaluate now that the lock is free
             self._maybe_auto_reconnect_amp()
+        return ok, err
 
-    async def _fix_metadata(self) -> None:
+    async def _fix_metadata(self) -> tuple[bool, str | None]:
         async with self._locks["amp"]:
             # under the lock for the same reason as in _device_command
             self._amp_user_disconnected = False  # the user wants the amp up
             ok, err = await self.engine.fix_metadata()
-        self._publish_retained(
-            self.cfg.topic("device", "amp", "result"),
-            json.dumps({"action": "fix_metadata", "ok": ok, "error": err, "ts": _now_iso()}))
+        self._record_result(AMP_SLUG, "fix_metadata", ok, err)
         # a drop edge (or gate-ON) that landed while we held the lock was
         # suppressed; re-evaluate now that the lock is free
         self._maybe_auto_reconnect_amp()
+        return ok, err
 
     # ------------------------------------------------- amp auto-reconnect
 
@@ -270,7 +360,8 @@ class App:
         filtered out: the amp lock is held during fix_metadata / manual
         commands, and a user OFF sets _amp_user_disconnected.
         """
-        if not self._auto_reconnect or self._amp_user_disconnected or self._amp_connected:
+        if (self.roster.amp is None or not self._auto_reconnect
+                or self._amp_user_disconnected or self._amp_connected):
             return
         if self._locks[AMP_SLUG].locked():
             return  # deliberate amp operation in flight
@@ -308,19 +399,14 @@ class App:
                 # (this cycle is still running) — a failed attempt, not a success
                 ok, err = False, "link dropped immediately after connect"
             if ok:
-                self._publish_retained(
-                    self.cfg.topic("device", AMP_SLUG, "result"),
-                    json.dumps({"action": "auto_reconnect", "ok": True, "error": None,
-                                "attempt": attempt, "ts": _now_iso()}))
+                self._record_result(AMP_SLUG, "auto_reconnect", True, None, attempt=attempt)
                 return
             if attempt < cfg.amp_reconnect_tries:
                 await asyncio.sleep(cfg.amp_reconnect_retry_delay_s)
         log.error("amp auto-reconnect: giving up after %d attempts (%s)",
                   cfg.amp_reconnect_tries, err)
-        self._publish_retained(
-            self.cfg.topic("device", AMP_SLUG, "result"),
-            json.dumps({"action": "auto_reconnect", "ok": False, "error": err,
-                        "attempt": cfg.amp_reconnect_tries, "ts": _now_iso()}))
+        self._record_result(AMP_SLUG, "auto_reconnect", False, err,
+                            attempt=cfg.amp_reconnect_tries)
 
     def _set_auto_reconnect(self, enabled: bool) -> None:
         if enabled != self._auto_reconnect:
@@ -338,29 +424,13 @@ class App:
     # ------------------------------------------------- system power commands
 
     async def _system_command(self, action: str) -> None:
-        verb = {"reboot": "reboot", "shutdown": "poweroff"}[action]
         async with self._locks["system"]:
             log.warning("system %s requested via MQTT", action)
-            err: str | None = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "sudo", "-n", "systemctl", verb,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE)
-                try:
-                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=20)
-                except asyncio.TimeoutError:
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass  # sudo runs setuid root; kill may be EPERM
-                    raise
-                ok = proc.returncode == 0
-                if not ok:
-                    err = (stderr.decode("utf-8", errors="replace").strip()
-                           or f"systemctl {verb} exited {proc.returncode}")
-            except (OSError, asyncio.TimeoutError) as e:
-                ok, err = False, f"systemctl {verb}: {e}"
+            # logind decides, through polkit: no sudo (system.py). Only the
+            # API service's account holds that grant, so on a node installed
+            # by install.sh this fails cleanly; the API's /node/reboot is the
+            # way there
+            ok, err = await power(action)
             if not ok:
                 log.error("system %s failed: %s", action, err)
             topic = self.cfg.topic("system", "result")
@@ -405,7 +475,7 @@ class App:
 
         if len(parts) == 3 and parts[0] == "device" and parts[2] == "set":
             slug = parts[1]
-            if slug not in self.cfg.by_slug:
+            if slug not in self.roster.by_slug:
                 log.warning("command for unknown device slug %r", slug)
                 return
             action = {"ON": "connect", "OFF": "disconnect"}.get(text.upper())
@@ -469,6 +539,16 @@ class App:
         # error results) even while bluetoothd is down and the engine retries.
         self.mqtt.start()
 
+        control = None
+        if self.node is not None:
+            from .control import ControlServer
+            control = ControlServer(self.node, self.cfg.control_socket)
+            try:
+                await control.start()
+            except OSError as e:
+                log.error("control socket %s: %s", self.cfg.control_socket, e)
+                control = None
+
         async def run_engine():
             nonlocal exit_code
             try:
@@ -501,6 +581,10 @@ class App:
         consumer = asyncio.create_task(consume())
         await stop.wait()
         log.info("shutting down")
+        if control is not None:
+            await control.stop()
+        if self.node is not None:
+            self.node.stop()
         if self.amp_export is not None:
             await self.amp_export.stop()
         if self.shairport is not None:

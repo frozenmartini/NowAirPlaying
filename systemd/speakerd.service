@@ -1,8 +1,16 @@
-# User unit (linger on): sees both the system bus (BlueZ) and the user
-# session (PipeWire ordering). No network-online dependency; paho retries.
+# User unit of the nowairplaying account (linger on): sees both the system
+# bus (BlueZ) and the user session (PipeWire ordering). No network-online
+# dependency; the MQTT client retries on its own.
+#
+# From 0.0.2 speakerd also serves the node API's local control socket,
+# /run/nowairplaying/speakerd.sock (/etc/tmpfiles.d/nowairplaying.conf) --
+# not ports 8443/8080 directly, which the separate nowairplaying-api
+# account/service (systemd/nowairplaying-api.service) serves instead, since
+# shairport-sync listens to the whole LAN and this account must hold no
+# polkit grants. speakerd starts with or without an amplifier paired.
 
 [Unit]
-Description=NowAirPlaying speakerd (BlueZ + AirPlay metadata -> amp screen, MQTT)
+Description=NowAirPlaying speakerd (BlueZ + AirPlay metadata -> amp screen, node API socket)
 After=pipewire.service wireplumber.service
 Wants=pipewire.service wireplumber.service
 
@@ -13,6 +21,8 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 -m speakerd --config %h/.config/speakerd/config.toml
 Restart=always
 RestartSec=5
+CPUWeight=500
+MemoryMin=64M
 
 [Install]
 WantedBy=default.target

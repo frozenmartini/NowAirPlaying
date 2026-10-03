@@ -7,6 +7,17 @@
 # Every install run records its progress in /var/lib/nowairplaying/install.json
 # (docs/INSTALL-STATE.md). install/bootstrap.sh fetches a release and runs this.
 #
+# From 0.0.2 the whole audio stack (PipeWire, WirePlumber, shairport-sync,
+# speakerd) runs as the system account "nowairplaying", not as --user.
+# The node API runs as a second system account, "nowairplaying-api": it is
+# the only polkit subject, since shairport-sync listens to the whole LAN and
+# the audio account must hold no grants. speakerd (as nowairplaying) serves
+# the API over a local control socket; nothing of ours shares one account
+# with the other.
+# --user is now the SSH login user: it's added to group nowairplaying-api
+# (so it can plant a fresh claim token without sudo, docs/SETUP-API.md), and
+# its 0.0.1-era units and config are migrated into the new account once.
+#
 # Runs from a copy of this repo that carries the built packages
 # (build/README.md), or from --packages DIR laid out the same way:
 #   bookworm: build/out/debs, plus the vendored PipeWire/WirePlumber in
@@ -15,12 +26,16 @@
 #
 # Usage:
 #   sudo install/install.sh [--amp-mac AA:BB:CC:DD:EE:FF] [--name "Now AirPlaying"]
-#                           [--phones onboard|dongle] [--user NAME]
+#                           [--phones onboard|dongle] --user NAME
 #                           [--packages DIR] [--force]
 #   sudo install/install.sh --verify        # phase 6 only
 #
-# Without --amp-mac everything is installed but speakerd stays off, and the
-# script ends with the pairing checklist. Pair, then re-run with --amp-mac.
+# --amp-mac pre-fills the amplifier's address in speakerd's config, same as
+# today, but it's no longer required: speakerd always starts, with or
+# without an amp. Pairing is normally done from Home Assistant or the node's
+# own setup page (http://<hostname>.local:8080/), not from this installer.
+# --name is optional too: given, it renames the AirPlay receiver; omitted,
+# the current name (or the config example's) is left alone.
 # --phones is accepted for phone Bluetooth, which is not built yet: so far it
 # changes nothing.
 set -eu
@@ -30,15 +45,21 @@ REPO=$(dirname "$HERE")
 LOG=${NAP_LOG:-/var/log/nowairplaying-install.log}
 VERSION=$(cat "$REPO/VERSION" 2>/dev/null || echo unknown)
 
-usage() { sed -n '16,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '22,35p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 say()  { printf '\n== %s\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
+# A preflight failure that means something already on the Pi would clash
+# with NowAirPlaying, not a broken install: status.sh's finish_status gives
+# it the reason preflight_conflict instead of the generic install_failed,
+# by recognising this exact prefix in the log's last ERROR line.
+conflict() { die "preflight_conflict: $*"; }
 
 [ "$(id -u)" = 0 ] || die "run with sudo: sudo $0 $*"
 
 USER_NAME=${SUDO_USER:-}
 AMP_MAC=
+AMP_NAME_CARRY=
 AIRPLAY_NAME=
 PHONES=onboard
 PKGS=
@@ -71,6 +92,9 @@ if [ -n "$AMP_MAC" ]; then
     [ "$AMP_MAC" != 00:00:00:00:00:00 ] || die "--amp-mac: 00:00:00:00:00:00 is the placeholder"
 fi
 case "$AIRPLAY_NAME" in *'"'*|*'\'*|*/*|*'&'*) die "--name: no quotes, backslashes, / or &" ;; esac
+# and no control characters: a newline would break shairport-sync.conf's name line
+[ "$(printf '%s' "$AIRPLAY_NAME" | tr -d '[:cntrl:]')" = "$AIRPLAY_NAME" ] \
+    || die "--name: no control characters"
 case "$PHONES" in onboard|dongle) ;; *) die "--phones: onboard or dongle, not $PHONES" ;; esac
 case "$PKGS" in *[[:space:]]*) die "--packages: the path must not contain spaces" ;; esac
 
@@ -78,6 +102,23 @@ case "$PKGS" in *[[:space:]]*) die "--packages: the path must not contain spaces
 . "$HERE/status.sh"
 STARTED=${NAP_STARTED:-$(date -Is)}
 LOG_OFFSET=${NAP_LOG_OFFSET:-$(log_size)}
+
+# the system account the audio stack runs as. Resolved here (not just
+# created in phase 4) so --verify, which skips phases 1-5 entirely, still
+# knows whose session to check.
+# Its home is a subdirectory of STATE_DIR, never STATE_DIR itself: STATE_DIR
+# holds what root reads back (install.json, install-args) and the API's
+# claim/, update/ and tls/, so it stays root:root 0755. An account that owned
+# it could rename any of those and feed root its own.
+NAP_USER=nowairplaying
+NAP_HOME=$STATE_DIR/home
+NAP_UID=$(id -u "$NAP_USER" 2>/dev/null) || NAP_UID=
+
+# the account that runs the node API and is polkit's only subject
+# (docs/SETUP-API.md "Privileges"). Resolved here too, so preflight's port
+# check and --verify know it before phase 4 creates it.
+NAP_API_USER=nowairplaying-api
+NAP_API_HOME=/var/lib/nowairplaying-api
 
 # phase N NAME: record an install run's progress (--verify only reads)
 phase() { [ "$VERIFY_ONLY" = 1 ] || write_status installing "$1" "$2" "" "" ""; }
@@ -138,21 +179,63 @@ apt_install() {
 
 hold() { apt-mark hold "$@" >/dev/null; info "held: $*"; }
 
-# run a command as the node user, inside their systemd user session
+# run a command as the nowairplaying account, inside its systemd user session
 as_user() {
-    runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$USER_UID" \
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" "$@"
+    runuser -u "$NAP_USER" -- env HOME="$NAP_HOME" XDG_RUNTIME_DIR="/run/user/$NAP_UID" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$NAP_UID/bus" "$@"
 }
 user_ctl() { as_user systemctl --user "$@"; }
+as_user_mkdir() { runuser -u "$NAP_USER" -- mkdir -p "$@"; }
 
 # put SRC DEST MODE OWNER: install SRC at DEST if it differs. Returns 0 when
-# DEST changed, 1 when it was already identical.
+# DEST changed, 1 when it was already identical -- so call it under "if", or
+# with "|| true" when the change doesn't matter. Never bare: under set -e an
+# unchanged file would end the whole install with no message.
 put() {
     if [ -f "$2" ] && cmp -s "$1" "$2" && [ "$(stat -c '%a %U' "$2")" = "$3 $4" ]; then
         return 1
     fi
-    install -m "$3" -o "$4" -g "$(id -gn "$4")" "$1" "$2"
+    # die, not set -e: set -e is off inside "if put" and "put || true"
+    install -m "$3" -o "$4" -g "$(id -gn "$4")" "$1" "$2" || die "could not write $2"
     info "wrote $2"
+}
+
+# Files in the nowairplaying account's own home are read and written by the
+# account itself, never by root. It controls every directory in there, so a
+# link it planted would otherwise turn a root write into a write anywhere
+# (say, a unit file in /etc/systemd/system/*.wants), and a root read into a
+# copy of any file it likes.
+#
+# user_read FILE: FILE's contents, read as nowairplaying
+user_read() { runuser -u "$NAP_USER" -- cat -- "$1"; }
+
+# put_user SRC DEST MODE: put, for a file in the nowairplaying account's
+# home. SRC is root's, and goes to the account on stdin.
+put_user() {
+    if runuser -u "$NAP_USER" -- sh -c \
+        '[ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c %a "$1")" = "$2" ] && cmp -s - "$1"' \
+        sh "$2" "$3" < "$1"; then
+        return 1
+    fi
+    runuser -u "$NAP_USER" -- sh -c \
+        'umask 077; t=$1.nap; cat > "$t" && chmod "$2" "$t" && mv -f "$t" "$1"' \
+        sh "$2" "$3" < "$1" || die "could not write $2"
+    info "wrote $2"
+}
+
+# set_amp_kv FILE KEY VALUE: set KEY = "VALUE" in a speakerd config file,
+# whether KEY is already live, commented out, or missing entirely --
+# config/config.example.toml may ship any of the three, since amp_mac is
+# optional from 0.0.2.
+set_amp_kv() {
+    f=$1; k=$2; v=$3
+    if grep -Eq "^[[:space:]]*$k[[:space:]]*=" "$f"; then
+        sed -E "s/^([[:space:]]*)$k[[:space:]]*=.*/\1$k = \"$v\"/" "$f" > "$f.nap" && mv "$f.nap" "$f"
+    elif grep -Eq "^[[:space:]]*#[[:space:]]*$k[[:space:]]*=" "$f"; then
+        sed -E "s/^[[:space:]]*#[[:space:]]*$k[[:space:]]*=.*/$k = \"$v\"/" "$f" > "$f.nap" && mv "$f.nap" "$f"
+    else
+        printf '%s = "%s"\n' "$k" "$v" >> "$f"
+    fi
 }
 
 TMP=$(mktemp -d)
@@ -163,22 +246,33 @@ trap 'exit 130' INT TERM
 epoch() { [ -n "$1" ] && date -d "$1" +%s 2>/dev/null || echo 0; }
 
 # the amp address speakerd is configured with, or empty for the placeholder
+# the amp speakerd uses: its state file wins (a pair or forget over the node
+# API is stored there, and an "amp": null there means forgotten), else
+# config.toml's amp_mac
 configured_amp() {
-    [ -f "$SPEAKERD_CONF" ] || return 0
-    sed -n 's/^amp_mac *= *"\([0-9A-Fa-f:]*\)".*/\1/p' "$SPEAKERD_CONF" | head -1 \
+    id -u "$NAP_USER" >/dev/null 2>&1 || return 0
+    a=$(user_read "$NAP_HOME/.local/state/speakerd/state.json" 2>/dev/null | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if "amp" in d: print((d["amp"] or {}).get("mac") or "-")' 2>/dev/null || true)
+    case "$a" in
+        -) return 0 ;;
+        ??:??:??:??:??:??) echo "$a"; return 0 ;;
+    esac
+    user_read "$SPEAKERD_CONF" 2>/dev/null \
+        | sed -n 's/^amp_mac *= *"\([0-9A-Fa-f:]*\)".*/\1/p' | head -1 \
         | grep -v '^00:00:00:00:00:00$' || true
 }
 
 # ---------------------------------------------------------------- setup
 
 [ -n "$USER_NAME" ] || die "no target user: run with sudo from the Pi's own user, or pass --user NAME"
-[ "$USER_NAME" != root ] || die "the audio stack runs as a normal user, not root: pass --user NAME"
+[ "$USER_NAME" != root ] || die "--user must be a normal login user, not root"
 USER_UID=$(id -u "$USER_NAME" 2>/dev/null) || die "no such user: $USER_NAME"
 USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
-SPEAKERD_CONF=$USER_HOME/.config/speakerd/config.toml
-SHAIRPORT_CONF=$USER_HOME/.config/shairport-sync.conf
-WP_CONF=$USER_HOME/.config/wireplumber/wireplumber.conf.d/90-nowairplaying.conf
-UNIT_DIR=$USER_HOME/.config/systemd/user
+SPEAKERD_CONF=$NAP_HOME/.config/speakerd/config.toml
+SHAIRPORT_CONF=$NAP_HOME/.config/shairport-sync.conf
+WP_CONF=$NAP_HOME/.config/wireplumber/wireplumber.conf.d/90-nowairplaying.conf
+UNIT_DIR=$NAP_HOME/.config/systemd/user
 
 # bookworm: PipeWire 1.4 vendored from backports, our BlueZ 5.87 replaces
 # Debian's 5.66 (which ignores [AVRCP]).
@@ -205,9 +299,46 @@ VENDOR_DEBS=
 if [ "$CODENAME" = bookworm ]; then
     VENDOR_DEBS=$(awk -v d="$PKGS/vendor" 'NF == 2 {print d "/" $2}' "$REPO/build/vendor.lock")
 fi
-SYS_PKGS="dbus-user-session python3-dbus-next python3-paho-mqtt avahi-daemon libnss-mdns $ARCHIVE_PW"
+SYS_PKGS="dbus-user-session python3-dbus-next python3-paho-mqtt python3-aiohttp \
+avahi-daemon libnss-mdns openssl unattended-upgrades $ARCHIVE_PW"
 
 # ---------------------------------------------------------------- 1 preflight
+
+# TCP 8443/8080 (the node API, served by nowairplaying-api, not speakerd) and
+# UDP 319/320 (nqptp) must be free, or already ours: a re-run finds its own
+# nowairplaying-api/nqptp bound there.
+check_ports_free() {
+    for p in 8443 8080; do
+        pid=$(ss -Hltnp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+        [ -n "$pid" ] || continue
+        owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+        [ "$owner" = "$NAP_API_USER" ] && continue
+        conflict "TCP port $p is already used by pid $pid (user $owner), not $NAP_API_USER"
+    done
+    for p in 319 320; do
+        pid=$(ss -Hlunp "sport = :$p" 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -1)
+        [ -n "$pid" ] || continue
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null)
+        [ "$comm" = nqptp ] && continue
+        conflict "UDP port $p is already used by pid $pid ($comm), not nqptp"
+    done
+}
+
+# another AirPlay receiver already running is a conflict; shairport-sync
+# running as $NAP_USER (ours, a re-run) or as $USER_NAME (the 0.0.1 layout,
+# about to be migrated) is not.
+check_other_airplay() {
+    for p in uxplay owntone; do
+        pgrep -x "$p" >/dev/null 2>&1 && conflict "another AirPlay receiver is running: $p"
+    done
+    for pid in $(pgrep -x shairport-sync 2>/dev/null || true); do
+        owner=$(ps -o user= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+        case "$owner" in
+            "$NAP_USER"|"$USER_NAME") continue ;;
+        esac
+        conflict "shairport-sync (pid $pid) is already running as ${owner:-an unknown user}, not $NAP_USER or $USER_NAME"
+    done
+}
 
 preflight() {
     phase 1 preflight
@@ -230,12 +361,13 @@ preflight() {
     [ "$arch" = arm64 ] || die "needs Raspberry Pi OS 64-bit (arm64), this is $arch"
     for dm in lightdm gdm3 sddm; do
         if installed "$dm"; then
-            die "this is the desktop edition ($dm is installed). NowAirPlaying
-       needs Raspberry Pi OS Lite: the desktop runs a second audio session."
+            conflict "this is the desktop edition ($dm is installed): NowAirPlaying needs Raspberry Pi OS Lite, since the desktop runs a second audio session"
         fi
     done
+    check_ports_free
+    check_other_airplay
     info "system: Raspberry Pi OS $CODENAME $arch, Lite"
-    info "user: $USER_NAME ($USER_HOME)"
+    info "SSH user: $USER_NAME ($USER_HOME); audio runs as $NAP_USER"
 
     for f in $DEBS; do
         [ -f "$f" ] || die "missing $f. Build the packages first (build/README.md)."
@@ -276,6 +408,16 @@ phase_apt() {
         # shellcheck disable=SC2086
         hold $(deb_names $VENDOR_DEBS)
     fi
+
+    # OS security updates: not something Home Assistant does from the API.
+    # nqptp and shairport-sync stay apt-held above, so this can't replace them.
+    cat > "$TMP/20auto-upgrades" <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+    put "$TMP/20auto-upgrades" /etc/apt/apt.conf.d/20auto-upgrades 644 root || true
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null
+    info "unattended-upgrades enabled"
 }
 
 # ---------------------------------------------------------------- 3 packages
@@ -305,9 +447,156 @@ phase_packages() {
 
 # ---------------------------------------------------------------- 4 units
 
+# create_nap_user: the system account the audio stack runs as from 0.0.2
+# (docs/SETUP-API.md "The service": "our own account"). Idempotent: a
+# re-run only fixes up group membership and ownership.
+create_nap_user() {
+    # STATE_DIR is root's (see NAP_HOME above). status.sh has usually made it
+    # already; this also takes it back from any earlier layout.
+    install -d -m 0755 -o root -g root "$STATE_DIR"
+    if ! id -u "$NAP_USER" >/dev/null 2>&1; then
+        useradd --system --home-dir "$NAP_HOME" --create-home --shell /usr/sbin/nologin \
+            --user-group "$NAP_USER"
+        info "created system account $NAP_USER"
+    fi
+    home=$(getent passwd "$NAP_USER" | cut -d: -f6)
+    [ "$home" = "$NAP_HOME" ] \
+        || die "the $NAP_USER account's home is $home, not $NAP_HOME (an early 0.0.2 test build?): remove the account, keeping its files (sudo loginctl disable-linger $NAP_USER; sudo userdel $NAP_USER), and re-run"
+    NAP_UID=$(id -u "$NAP_USER")
+    extra=audio
+    getent group bluetooth >/dev/null 2>&1 && extra="$extra,bluetooth"
+    usermod -aG "$extra" "$NAP_USER"
+
+    # nobody else needs anything in here: the API reaches speakerd through
+    # the control socket in /run/nowairplaying
+    chown -h "$NAP_USER:$NAP_USER" "$NAP_HOME"
+    chmod 0700 "$NAP_HOME"
+
+    # linger: the account's session (PipeWire, shairport-sync, speakerd)
+    # starts at boot with nobody logged in
+    if [ "$(loginctl show-user "$NAP_USER" -p Linger --value 2>/dev/null)" != yes ]; then
+        loginctl enable-linger "$NAP_USER"
+        info "linger enabled for $NAP_USER"
+    fi
+}
+
+# create_nap_api_user: the system account that runs the node API and is
+# polkit's only subject (docs/SETUP-API.md "Privileges"). It gets no extra
+# groups: it reaches BlueZ and PipeWire only through speakerd's local
+# control socket, never directly. Idempotent, like create_nap_user.
+create_nap_api_user() {
+    if ! id -u "$NAP_API_USER" >/dev/null 2>&1; then
+        useradd --system --home-dir "$NAP_API_HOME" --create-home --shell /usr/sbin/nologin \
+            --user-group "$NAP_API_USER"
+        info "created system account $NAP_API_USER"
+    fi
+    chown "$NAP_API_USER:$NAP_API_USER" "$NAP_API_HOME"
+    chmod 0750 "$NAP_API_HOME"
+
+    # so the SSH user can plant a fresh claim token without sudo, from their
+    # next login (docs/SETUP-API.md "Ownership")
+    usermod -aG "$NAP_API_USER" "$USER_NAME"
+}
+
+# ensure_tmpfiles: /run/nowairplaying, the control socket directory speakerd
+# (nowairplaying) listens on and the API (nowairplaying-api) connects to.
+# /run is tmpfs, so tmpfiles.d recreates this at every boot; run it now too,
+# so a re-run has it immediately instead of waiting for the next boot. Must
+# run after both accounts exist and before either speakerd or the API
+# service is (re)started.
+ensure_tmpfiles() {
+    cat > "$TMP/tmpfiles.conf" <<EOF
+d /run/nowairplaying 2750 $NAP_USER $NAP_API_USER -
+EOF
+    put "$TMP/tmpfiles.conf" /etc/tmpfiles.d/nowairplaying.conf 644 root || true
+    systemd-tmpfiles --create /etc/tmpfiles.d/nowairplaying.conf
+}
+
+# migrate_old_layout: 0.0.1 (and the 09-28 manual installs) ran the stack as
+# --user. Stop and remove just the two unit files we planted there, and
+# carry over a real amp_mac if nowairplaying doesn't have one yet. Bluetooth
+# bonds are system-wide (/var/lib/bluetooth) and need nothing. --user's
+# linger, if 0.0.1 turned it on, is left alone: we can't tell whether we did.
+migrate_old_layout() {
+    old_dir=$USER_HOME/.config/systemd/user
+    migrated=
+    for u in speakerd shairport-sync; do
+        f=$old_dir/$u.service
+        [ -f "$f" ] || continue
+        runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
+            systemctl --user disable --now "$u.service" >/dev/null 2>&1 || true
+        rm -f "$f"
+        migrated=1
+        info "migrated: stopped the old $USER_NAME $u.service and removed its unit file"
+    done
+
+    old_conf=$USER_HOME/.config/speakerd/config.toml
+    if [ -f "$old_conf" ] && [ -z "$(configured_amp)" ]; then
+        old_amp=$(sed -n 's/^amp_mac *= *"\([0-9A-Fa-f:]*\)".*/\1/p' "$old_conf" | head -1 \
+            | grep -v '^00:00:00:00:00:00$' || true)
+        if [ -n "$old_amp" ]; then
+            AMP_MAC=${AMP_MAC:-$old_amp}
+            AMP_NAME_CARRY=$(sed -n 's/^amp_name *= *"\([^"]*\)".*/\1/p' "$old_conf" | head -1)
+            # set_amp_kv puts it in a sed replacement: carry only a safe name
+            case "$AMP_NAME_CARRY" in *'\'*|*/*|*'&'*) AMP_NAME_CARRY= ;; esac
+            info "carrying amp_mac $old_amp over from the old layout"
+        fi
+    fi
+
+    # 0.0.1's WirePlumber drop-in turned seat monitoring off for --user, so
+    # their WirePlumber would keep a Bluetooth monitor of its own running next
+    # to nowairplaying's, and the two would fight over the audio endpoints.
+    # Without it, theirs only watches Bluetooth during a local seat session.
+    old_wp=$USER_HOME/.config/wireplumber/wireplumber.conf.d/90-nowairplaying.conf
+    if [ -f "$old_wp" ]; then
+        rm -f "$old_wp"
+        runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$USER_UID" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_UID/bus" \
+            systemctl --user try-restart wireplumber.service >/dev/null 2>&1 || true
+        migrated=1
+        info "migrated: removed the old WirePlumber drop-in from $USER_NAME's home"
+    fi
+
+    [ -z "$migrated" ] || info "note: $USER_NAME's linger was left as it was; this installer can't tell if 0.0.1 turned it on"
+}
+
+# USER= and PHONES= for install/update.sh, which has no flags of its own
+# (docs/SETUP-API.md "POST /node/update")
+write_install_args() {
+    printf 'USER=%s\nPHONES=%s\n' "$USER_NAME" "$PHONES" > "$TMP/install-args"
+    put "$TMP/install-args" "$STATE_DIR/install-args" 644 root || true
+}
+
+# the update unit, the Wi-Fi unit, the API unit, and the scripts they run,
+# so a later /node/update or a boot-time Wi-Fi join needs no SSH session
+# (docs/INSTALL-STATE.md "Rollback")
+install_update_lib() {
+    install -d -m 0755 /usr/local/lib/nowairplaying
+    for f in update.sh bootstrap.sh status.sh wifi-add.sh; do
+        put "$REPO/install/$f" "/usr/local/lib/nowairplaying/$f" 755 root || true
+    done
+    put "$REPO/systemd/nowairplaying-update.service" /etc/systemd/system/nowairplaying-update.service 644 root || true
+    put "$REPO/systemd/nowairplaying-reset.service" /etc/systemd/system/nowairplaying-reset.service 644 root || true
+    put "$REPO/systemd/nowairplaying-wifi.service" /etc/systemd/system/nowairplaying-wifi.service 644 root || true
+    if put "$REPO/systemd/nowairplaying-api.service" /etc/systemd/system/nowairplaying-api.service 644 root; then
+        API_UNIT_CHANGED=1
+    fi
+    systemctl daemon-reload
+    systemctl enable nowairplaying-reset.service nowairplaying-wifi.service nowairplaying-api.service >/dev/null
+}
+
 phase_units() {
     phase 4 units
-    say "4/6 speakerd and the user units"
+    say "4/6 The nowairplaying account, speakerd and the units"
+
+    create_nap_user
+    create_nap_api_user
+    ensure_tmpfiles
+    migrate_old_layout
+    write_install_args
+    install_update_lib
+
     if ! diff -rq -x __pycache__ "$REPO/speakerd" /opt/nowairplaying/speakerd >/dev/null 2>&1; then
         rm -rf /opt/nowairplaying/speakerd
         install -d -m 755 /opt/nowairplaying/speakerd
@@ -318,7 +607,7 @@ phase_units() {
 
     as_user_mkdir "$UNIT_DIR"
     for u in speakerd shairport-sync; do
-        if put "$REPO/systemd/$u.service" "$UNIT_DIR/$u.service" 644 "$USER_NAME"; then
+        if put_user "$REPO/systemd/$u.service" "$UNIT_DIR/$u.service" 644; then
             case "$u" in
                 speakerd) SPEAKERD_CHANGED=1 ;;
                 shairport-sync) SHAIRPORT_CHANGED=1 ;;
@@ -326,15 +615,9 @@ phase_units() {
         fi
     done
 
-    # linger: the user's session (PipeWire, shairport-sync, speakerd) starts
-    # at boot with nobody logged in
-    if [ "$(loginctl show-user "$USER_NAME" -p Linger --value 2>/dev/null)" != yes ]; then
-        loginctl enable-linger "$USER_NAME"
-        info "linger enabled for $USER_NAME"
-    fi
     i=0
-    until [ -S "/run/user/$USER_UID/bus" ]; do
-        i=$((i + 1)); [ $i -le 30 ] || die "the user session bus for $USER_NAME did not come up"
+    until [ -S "/run/user/$NAP_UID/bus" ]; do
+        i=$((i + 1)); [ $i -le 30 ] || die "the user session bus for $NAP_USER did not come up"
         sleep 1
     done
 
@@ -352,13 +635,82 @@ phase_units() {
     info "enabled: pipewire, wireplumber, shairport-sync"
 }
 
-as_user_mkdir() { runuser -u "$USER_NAME" -- mkdir -p "$@"; }
-
 # ---------------------------------------------------------------- 5 configure
+
+# the directories the node API needs, all owned by nowairplaying-api, the
+# only account that touches them (docs/SETUP-API.md), in root's STATE_DIR
+# next to install.json. install -d re-applies mode and ownership even when
+# the directory already exists. Their entries sit in a root-owned directory,
+# so the API account can't swap one for a link; a link left by an earlier
+# layout is removed rather than followed.
+#
+# Root never chowns or chmods the files inside them: the API account owns
+# those directories, and chown and chmod follow a link it could plant there
+# (tls/key.pem -> /etc/shadow).
+ensure_dirs() {
+    for d in claim:2770 update:0700 tls:0700; do
+        p=$STATE_DIR/${d%%:*}
+        [ ! -L "$p" ] || rm -f "$p"
+        install -d -m "${d#*:}" -o "$NAP_API_USER" -g "$NAP_API_USER" "$p"
+    done
+}
+
+# a claim token Home Assistant planted at --user's home, over SSH with no
+# sudo, before the install (docs/SETUP-API.md "Ownership"). Never printed.
+# Owned by nowairplaying-api, the only account that reads it. An existing
+# one is left exactly as it is (see ensure_dirs: no root chown in there); one
+# the API can't read locks /claim rather than opening it.
+migrate_claim_token() {
+    src=$USER_HOME/.config/nowairplaying/claim-token
+    dest=$STATE_DIR/claim/claim-token
+    [ -f "$src" ] || return 0
+    # root copies it: never follow a link to some other file
+    [ ! -L "$src" ] || { rm -f "$src"; info "ignored a claim-token that was a symlink"; return 0; }
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+        rm -f "$src"
+        return 0
+    fi
+    install -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$src" "$dest"
+    rm -f "$src"
+    info "moved a planted claim token into place"
+}
+
+# a self-signed EC P-256 certificate, made once and kept across re-runs and
+# updates (docs/SETUP-API.md "Trust: the pinned certificate"). Owned by
+# nowairplaying-api, which serves it. A re-run keeps a pair of real files as
+# they are, without touching them (see ensure_dirs), and replaces a missing
+# one or a link (install(1) replaces a link rather than writing through it).
+# CERT_CHANGED is only set when a certificate is actually generated, so
+# install.sh only restarts the API service on a real change.
+ensure_tls() {
+    c=$STATE_DIR/tls/cert.pem; k=$STATE_DIR/tls/key.pem
+    if [ -f "$c" ] && [ ! -L "$c" ] && [ -f "$k" ] && [ ! -L "$k" ]; then
+        return 0
+    fi
+    hn=$(hostname)
+    ( umask 077
+      openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 \
+          -subj "/CN=nowairplaying" -addext "subjectAltName=DNS:$hn.local" \
+          -keyout "$TMP/key.pem" -out "$TMP/cert.pem" ) 2> "$TMP/openssl.err" \
+        || die "could not generate the TLS certificate: $(tail -1 "$TMP/openssl.err")"
+    install -m 0600 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/key.pem" "$k"
+    install -m 0644 -o "$NAP_API_USER" -g "$NAP_API_USER" "$TMP/cert.pem" "$c"
+    info "generated a self-signed TLS certificate for $hn.local (valid 100 years)"
+    CERT_CHANGED=1
+}
 
 phase_configure() {
     phase 5 configure
     say "5/6 Configuration"
+
+    ensure_dirs
+    migrate_claim_token
+    ensure_tls
+    # /usr/share, not /etc: the API's own verify check reads this file, and
+    # /etc/polkit-1/rules.d isn't readable by non-root. Remove any copy an
+    # earlier run left at the old, root-only path.
+    put "$REPO/polkit/50-nowairplaying.rules" /usr/share/polkit-1/rules.d/50-nowairplaying.rules 644 root || true
+    rm -f /etc/polkit-1/rules.d/50-nowairplaying.rules
 
     # BlueZ [AVRCP]: the Kohler advertises no AVRCP Target record, so without
     # these BlueZ refuses the volume path entirely
@@ -399,31 +751,28 @@ wireplumber.profiles = {
 }
 EOF
     as_user_mkdir "$(dirname "$WP_CONF")"
-    if put "$TMP/wp.conf" "$WP_CONF" 644 "$USER_NAME"; then WP_CHANGED=1; fi
+    if put_user "$TMP/wp.conf" "$WP_CONF" 644; then WP_CHANGED=1; fi
 
     # shairport-sync: from the example on first install; --name renames later
     as_user_mkdir "$(dirname "$SHAIRPORT_CONF")"
-    src=$SHAIRPORT_CONF
-    [ -f "$src" ] || src=$REPO/shairport/shairport-sync.conf.example
+    src=$TMP/shairport.current
+    user_read "$SHAIRPORT_CONF" > "$src" 2>/dev/null || src=$REPO/shairport/shairport-sync.conf.example
     if [ -n "$AIRPLAY_NAME" ]; then
         sed "s/^\([[:space:]]*name = \)\"[^\"]*\"/\1\"$AIRPLAY_NAME\"/" "$src" > "$TMP/shairport.conf"
     else
         cp "$src" "$TMP/shairport.conf"
     fi
-    if put "$TMP/shairport.conf" "$SHAIRPORT_CONF" 644 "$USER_NAME"; then SHAIRPORT_CHANGED=1; fi
+    if put_user "$TMP/shairport.conf" "$SHAIRPORT_CONF" 644; then SHAIRPORT_CHANGED=1; fi
 
-    # speakerd: from the example on first install; --amp-mac fills the address
+    # speakerd: from the example on first install. --amp-mac fills the
+    # address; amp_mac is otherwise optional from 0.0.2 (pairing is done over
+    # the node API, not by re-running this installer).
     as_user_mkdir "$(dirname "$SPEAKERD_CONF")"
-    src=$SPEAKERD_CONF
-    [ -f "$src" ] || src=$REPO/config/config.example.toml
-    if [ -n "$AMP_MAC" ]; then
-        sed "s/^amp_mac *= *\"[^\"]*\"/amp_mac = \"$AMP_MAC\"/" "$src" > "$TMP/speakerd.toml"
-        grep -q "^amp_mac = \"$AMP_MAC\"" "$TMP/speakerd.toml" \
-            || die "$SPEAKERD_CONF: no amp_mac line to set. Edit it by hand and re-run."
-    else
-        cp "$src" "$TMP/speakerd.toml"
-    fi
-    if put "$TMP/speakerd.toml" "$SPEAKERD_CONF" 600 "$USER_NAME"; then SPEAKERD_CHANGED=1; fi
+    user_read "$SPEAKERD_CONF" > "$TMP/speakerd.toml" 2>/dev/null \
+        || cp "$REPO/config/config.example.toml" "$TMP/speakerd.toml"
+    [ -n "$AMP_MAC" ] && set_amp_kv "$TMP/speakerd.toml" amp_mac "$AMP_MAC"
+    [ -n "$AMP_NAME_CARRY" ] && set_amp_kv "$TMP/speakerd.toml" amp_name "$AMP_NAME_CARRY"
+    if put_user "$TMP/speakerd.toml" "$SPEAKERD_CONF" 600; then SPEAKERD_CHANGED=1; fi
 
     # (re)start what changed, in dependency order
     if [ -n "${BT_CHANGED:-}" ] || ! bluetoothd_is_ours; then
@@ -438,15 +787,21 @@ EOF
         user_ctl restart shairport-sync.service
         info "restarted shairport-sync"
     fi
-    if [ -n "$(configured_amp)" ]; then
-        user_ctl enable speakerd.service
-        if [ -n "${SPEAKERD_CHANGED:-}" ] || ! user_ctl is-active --quiet speakerd.service; then
-            user_ctl restart speakerd.service
-            info "restarted speakerd"
-        fi
-    else
-        user_ctl disable --now speakerd.service >/dev/null 2>&1 || true
-        info "speakerd stays off until the amplifier is paired (checklist below)"
+    # speakerd always runs from 0.0.2: it starts with or without an amp and
+    # applies a pairing live, with no restart (docs/SETUP-API.md "The service")
+    user_ctl enable speakerd.service
+    if [ -n "${SPEAKERD_CHANGED:-}" ] || ! user_ctl is-active --quiet speakerd.service; then
+        user_ctl restart speakerd.service
+        info "restarted speakerd"
+    fi
+
+    # the node API: restarted on its own unit file changing, speakerd's
+    # Python code changing (it's the same tree), a freshly generated
+    # certificate, or simply not running yet
+    if [ -n "${API_UNIT_CHANGED:-}" ] || [ -n "${SPEAKERD_CHANGED:-}" ] || [ -n "${CERT_CHANGED:-}" ] \
+       || ! systemctl is-active --quiet nowairplaying-api.service; then
+        systemctl restart nowairplaying-api.service
+        info "restarted nowairplaying-api"
     fi
 }
 
@@ -468,10 +823,8 @@ bluetoothd_is_ours() {
 # ---------------------------------------------------------------- 6 verify
 
 FAILS=0
-TODO=0
 ok()   { printf '   ok    %s\n' "$*"; }
 bad()  { printf '   FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
-todo() { printf '   todo  %s\n' "$*"; TODO=$((TODO + 1)); }
 
 # wait up to $1 seconds for a command to succeed
 within() {
@@ -520,10 +873,10 @@ verify() {
         bad "PipeWire is not running at 1.4 or later (linked: ${pwv:-unknown}). 1.2.7 receives the phone's volume but never applies it."
     fi
 
-    if user_ctl is-active --quiet wireplumber.service && [ -f "$WP_CONF" ] \
-       && grep -q 'bluez5.dummy-avrcp-player = false' "$WP_CONF"; then
+    if user_ctl is-active --quiet wireplumber.service \
+       && user_read "$WP_CONF" 2>/dev/null | grep -q 'bluez5.dummy-avrcp-player = false'; then
         wp_start=$(epoch "$(user_ctl show --timestamp=unix -p ActiveEnterTimestamp --value wireplumber.service)")
-        if [ "$wp_start" -ge "$(stat -c %Y "$WP_CONF")" ]; then
+        if [ "$wp_start" -ge "$(runuser -u "$NAP_USER" -- stat -c %Y "$WP_CONF")" ]; then
             ok "WirePlumber running with its dummy AVRCP player off"
         else
             bad "WirePlumber started before $WP_CONF changed: restart it"
@@ -559,9 +912,9 @@ verify() {
     fi
 
     if within 15 as_user busctl --user status org.gnome.ShairportSync; then
-        ok "org.gnome.ShairportSync is on $USER_NAME's session bus"
+        ok "org.gnome.ShairportSync is on $NAP_USER's session bus"
     else
-        bad "org.gnome.ShairportSync is not on $USER_NAME's session bus: speakerd cannot follow AirPlay"
+        bad "org.gnome.ShairportSync is not on $NAP_USER's session bus: speakerd cannot follow AirPlay"
     fi
     if busctl --system status org.mpris.MediaPlayer2.ShairportSync >/dev/null 2>&1 \
        || as_user busctl --user status org.mpris.MediaPlayer2.ShairportSync >/dev/null 2>&1; then
@@ -570,27 +923,37 @@ verify() {
         ok "shairport-sync has no MPRIS player"
     fi
 
+    if user_ctl is-active --quiet speakerd.service; then
+        ok "speakerd is running"
+    else
+        bad "speakerd is not running: journalctl --user -u speakerd"
+    fi
+
+    if systemctl is-active --quiet nowairplaying-api.service; then
+        ok "nowairplaying-api is running"
+    else
+        bad "nowairplaying-api is not running: journalctl -u nowairplaying-api"
+    fi
+
     amp=$(configured_amp)
     if [ -z "$amp" ]; then
-        todo "pair the amplifier, then re-run with --amp-mac (checklist below)"
+        info "no amplifier paired yet: pair it from Home Assistant, or the setup page at http://$(hostname).local:8080/"
     else
         info_amp=$(bluetoothctl info "$amp" 2>/dev/null || true)
         if printf '%s' "$info_amp" | grep -q 'Paired: yes' \
            && printf '%s' "$info_amp" | grep -q 'Trusted: yes'; then
             ok "amplifier $amp is paired and trusted"
         else
-            bad "amplifier $amp is not paired and trusted (checklist below)"
+            bad "amplifier $amp is not paired and trusted"
         fi
         if user_ctl is-active --quiet speakerd.service; then
             since=$(epoch "$(user_ctl show --timestamp=unix -p ExecMainStartTimestamp --value speakerd.service)")
-            if within 15 sh -c "journalctl _UID=$USER_UID _SYSTEMD_USER_UNIT=speakerd.service \
+            if within 15 sh -c "journalctl _UID=$NAP_UID _SYSTEMD_USER_UNIT=speakerd.service \
                     --since @$since -q --no-pager | grep -q 'amp player registered'"; then
                 ok "one player on the amp's adapter: speakerd's /org/speakerd/player"
             else
                 bad "speakerd has not registered its player: journalctl --user -u speakerd"
             fi
-        else
-            bad "speakerd is not running: journalctl --user -u speakerd"
         fi
     fi
 
@@ -607,29 +970,18 @@ checklist() {
     if [ -z "$amp" ]; then
         cat <<EOF
 
-== Next: pair the amplifier (by hand, once)
-
-  1. Put the Kohler amplifier in pairing mode. It only shows up in a scan
-     while pairing mode is on.
-  2. On the Pi:
-         bluetoothctl
-           scan on             wait for the amplifier, note its address
-           pair  XX:XX:XX:XX:XX:XX
-           trust XX:XX:XX:XX:XX:XX
-           scan off
-           quit
-  3. Then:
-         sudo $0 --amp-mac XX:XX:XX:XX:XX:XX
-     This turns speakerd on and checks everything again.
+== Next: pair the amplifier
+  Pair it from Home Assistant, or the node's own setup page:
+      http://$(hostname).local:8080/
 EOF
     fi
     cat <<EOF
 
-== Optional: Home Assistant
+== Optional: MQTT, for people without Home Assistant
 
   Add an [mqtt] section to $SPEAKERD_CONF
   (see config/config.example.toml), then:
-      systemctl --user restart speakerd
+      sudo -u $NAP_USER XDG_RUNTIME_DIR=/run/user/$NAP_UID systemctl --user restart speakerd
 EOF
     echo
     echo "Log: $LOG"
@@ -650,9 +1002,5 @@ if [ "$FAILS" -gt 0 ]; then
     printf '\n%d check(s) FAILED.\n' "$FAILS"
     exit 1
 fi
-if [ "$TODO" -gt 0 ]; then
-    printf '\nInstalled. %d step(s) left to do (above).\n' "$TODO"
-else
-    printf '\nAll checks passed. AirPlay to "%s".\n' \
-        "$(sed -n 's/^[[:space:]]*name = "\([^"]*\)".*/\1/p' "$SHAIRPORT_CONF" | head -1)"
-fi
+printf '\nAll checks passed. AirPlay to "%s".\n' \
+    "$(sed -n 's/^[[:space:]]*name = "\([^"]*\)".*/\1/p' "$SHAIRPORT_CONF" | head -1)"

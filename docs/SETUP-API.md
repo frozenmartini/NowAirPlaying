@@ -1,7 +1,7 @@
 # Node API and setup page (v2)
 
-**Status: draft for review. Nothing here is implemented yet.** It replaces the v1 draft,
-which was never built.
+**Status: implemented for `0.0.2`, tested offline, not yet run on a Pi.** It replaces
+the v1 draft, which was never built.
 
 **Agreed with Home Assistant (`kohler-anthem-plus#003`):**
 - **Install over SSH, then this API** (2026-09-30). The install is in
@@ -11,15 +11,20 @@ which was never built.
   device card. Since Core 2026.8 a device belongs to exactly one config entry, so an MQTT
   card could no longer merge with Home Assistant's own.
 - **HTTPS with a pinned certificate.** Home Assistant reads the fingerprint over SSH
-  during the install.
+  during the install, and again whenever the certificate changes (Reconnect).
 - **State is pushed with SSE.** Commands are plain requests.
-- **Nothing the API can trigger runs as root,** except through the narrow polkit rules
-  listed under [Privileges](#privileges).
+- **Two accounts** (2026-10-02). The API runs as `nowairplaying-api`, the only account
+  with polkit grants. The audio stack runs as `nowairplaying` with none. See
+  [Privileges](#privileges).
+- **polkit for the update unit and logind only.** Nothing the API can trigger runs as
+  root except that.
+- **Wi-Fi is not an API call.** Home Assistant adds a network over SSH with `sudo`, or
+  the owner puts a file on the SD card. See [Wi-Fi](#wi-fi).
 
 Two clients use the API:
 
 - **the Home Assistant integration** (`kohler_anthem_plus`): it claims the node, pairs it
-  with the amplifier, shows its state, and runs Wi-Fi changes, updates and reboots;
+  with the amplifier, shows its state, and runs updates and reboots;
 - **the node's own setup page**, opened in a phone or computer browser, for people
   without Home Assistant.
 
@@ -32,26 +37,43 @@ MQTT stays in speakerd as an option for people without Home Assistant. It's set 
   remote access.
 - **A token only travels over HTTPS.** The setup page is plain HTTP, so browsers show no
   certificate warning. It can do only what needs no token.
-- **Our own account.** Everything runs as the system account `nowairplaying`, not as the
-  login user, so the owner's own scripts or a code agent on the same Pi can't break it
-  by accident.
+- **Our own accounts.** Nothing runs as the login user, so the owner's own scripts or a
+  code agent on the same Pi can't break it by accident.
 - **Least privilege.** The ports are above 1024, so no capability is needed. Root is
-  reached only through the polkit rules under [Privileges](#privileges).
+  reached only through the polkit rules under [Privileges](#privileges), which only the
+  API service's account holds.
 - **One API, two clients.** The setup page calls the same endpoints Home Assistant
   calls.
 
 ## The service
 
-| | |
-|---|---|
-| Process | **speakerd** serves the API itself, so the state it pushes is the state it holds. It starts with or without an amp and applies changes live, with no restart |
-| Unit | `speakerd.service`, a user unit of `nowairplaying`, which has linger, so it starts at boot with nobody logged in |
-| HTTPS API | port **8443**, all interfaces. Home Assistant reads the port from the zeroconf record and never hard-codes it |
-| HTTP setup page | port **8080**, all interfaces: `http://<hostname>.local:8080/` |
-| Home | `/var/lib/nowairplaying` (the account's home, mode 0755, so the SSH user can read `install.json` during the install. The secrets inside are 0600 or 0700) |
-| Config | `~nowairplaying/.config/speakerd/config.toml`, mode 0600 |
-| API state | `~nowairplaying/.config/nowairplaying/api.json`, mode 0600: the claim (the token's SHA-256, `claimed_by`, the time) |
-| Certificate | `/var/lib/nowairplaying/tls/cert.pem` and `key.pem`. Self-signed EC P-256, valid for 100 years, made once by the install |
+Two processes, two accounts:
+
+| | The API service | speakerd |
+|---|---|---|
+| Account | `nowairplaying-api` (system account, home `/var/lib/nowairplaying-api`) | `nowairplaying` (system account, home `/var/lib/nowairplaying/home`, mode 0700) |
+| Unit | `nowairplaying-api.service`, a system unit, sandboxed (`ProtectSystem=strict`, `NoNewPrivileges`) | `speakerd.service`, a user unit of `nowairplaying` with linger, so it starts at boot with nobody logged in |
+| Does | HTTPS and the setup page, the claim and its token, zeroconf, updates, reboot and power-off, the system-wide checks | Bluetooth (the amp, phones, the pairing agent), AirPlay metadata, renaming, the session checks, MQTT |
+| polkit grants | the update unit, reboot, power-off | none |
+| State | `/var/lib/nowairplaying-api/api.json`, mode 0600: the claim (the token's SHA-256, `claimed_by`, `area`, the time) | `~nowairplaying/.local/state/speakerd/state.json`: the amp, the name, auto-reconnect |
+
+- **`/var/lib/nowairplaying` itself is root's** (`root:root`, mode 0755, so the SSH user
+  can read `install.json`). It holds what root reads back, `install.json` and
+  `install-args`, and the API account's `claim/`, `update/` and `tls/`. Neither account
+  can rename anything in it.
+- **HTTPS API:** port **8443**, all interfaces. Home Assistant reads the port from the
+  zeroconf record and never hard-codes it.
+- **HTTP setup page:** port **8080**, all interfaces: `http://<hostname>.local:8080/`.
+- **Between them:** speakerd listens on `/run/nowairplaying/speakerd.sock`. Its directory
+  is setgid group `nowairplaying-api`, mode 2750, so only the API service can connect.
+  Newline-delimited JSON; speakerd pushes its audio state on every change.
+- **speakerd** starts with or without an amp, and applies a pairing or a rename live,
+  with no restart. If it's down, the API still answers: `/info`, `/verify` (with
+  `speakerd_running` failed) and `/state` work, and audio commands return
+  `502 failed`.
+- **Certificate:** `/var/lib/nowairplaying/tls/cert.pem` and `key.pem`, owned by
+  `nowairplaying-api`. Self-signed EC P-256, valid for 100 years, made once by the
+  install.
 
 **The certificate is kept** across re-runs and updates. A new one is made only if the
 files are missing. Home Assistant pins it by fingerprint, not by name or expiry, so the
@@ -79,16 +101,21 @@ the network can publish a TXT record.
 
 ## Trust: the pinned certificate
 
-- **Installed over SSH (the normal path).** When the install finishes, `install.json`
-  carries `cert_sha256`: the SHA-256 of the certificate in DER form, lowercase hex. HA
-  reads it over the same SSH session and pins it before its first API call. Nothing is
-  trusted on first contact.
+- **Installed over SSH (the normal path).** `install.json` carries `cert_sha256`: the
+  SHA-256 of the certificate in DER form, lowercase hex. It's written on every
+  `install.json` write once the certificate exists, so it's always the certificate the
+  API serves. HA reads it over the same SSH session and pins it before its first API
+  call. Nothing is trusted on first contact.
 - **Installed by hand,** then found by Home Assistant through zeroconf: there's no SSH
   session to read the fingerprint from. HA pins the certificate it sees at `/claim`
   (trust on first use) and checks it on every call after that.
-- **A changed certificate** means the card was rebuilt or the files were deleted. HA
-  stops calling the node and raises a repair. The user clears the claim with the
-  [reset file](#releasing-a-claim) and claims again.
+- **A changed certificate** (the files were deleted and a re-run made new ones): HA stops
+  calling the node and raises a repair with a **Reconnect** button (agreed 2026-10-02).
+  - Reconnect logs in over SSH with HA's key, against the pinned SSH host key, reads
+    `cert_sha256` from `install.json` again and pins the new value. No password and no
+    re-claim; the token and the amp pairing are untouched.
+  - If the SSH host key changed too (a rebuilt card), Reconnect refuses. The repair then
+    says to start fresh: the [reset file](#releasing-a-claim), then add the node again.
 
 ## Ownership: unclaimed and claimed
 
@@ -104,10 +131,14 @@ the network can publish a TXT record.
     `~/.config/nowairplaying/claim-token` over SSH, as the login user with no `sudo`.
     - The file holds the lowercase hex SHA-256 of 32 random bytes. It is mode 0600.
     - **The install moves it** to `/var/lib/nowairplaying/claim/claim-token`, owned by
-      `nowairplaying`, mode 0600.
-    - That directory is mode 2770, group `nowairplaying`. The install adds the login
-      user (`--user`) to that group. From their next SSH login, they can plant a fresh
-      token there directly, still without `sudo`.
+      `nowairplaying-api`, mode 0600.
+    - That directory is mode 2770, group `nowairplaying-api`. The install adds the
+      login user (`--user`) to that group. From their next SSH login, they can plant a
+      fresh token there directly, still without `sudo`. Plant it **mode 0640**: the
+      directory makes its group `nowairplaying-api`, which must be able to read it.
+    - **A planted file the API can't use locks the claim, it never opens it.** One it
+      can't read, or that isn't 64 hex characters, makes `/claim` return
+      `409 claim_token_invalid`, and `/info` still reports `"claim": "token"`.
     - `/claim` then needs `Authorization: Bearer <the 64-hex bytes>`.
     - The file is read on **every** `/claim` request, never once at startup. Whitespace
       around its contents is ignored.
@@ -132,8 +163,10 @@ Kohler directly) without opening Home Assistant. They don't change the configura
      shows up as a small drive on any computer.
   3. Power the Pi back on.
 
-  The node clears its claim, then deletes the file. Wi-Fi, the certificate and all
-  Bluetooth pairings are kept. Physical access to the card is the proof of ownership.
+  At boot, a root unit turns the file into `/var/lib/nowairplaying-api/reset-request`
+  and deletes it; the API service clears its claim and deletes the request. Wi-Fi, the
+  certificate and all Bluetooth pairings are kept. Physical access to the card is the
+  proof of ownership.
 
 ## Endpoints
 
@@ -142,8 +175,7 @@ All paths are under `/api/v2`. Bodies are JSON. The **Auth** column:
 - **none:** anyone, over HTTP or HTTPS.
 - **owner:** on an unclaimed node, anyone. On a claimed node, the token, over HTTPS only.
 - **token:** claimed nodes only, with the token, over HTTPS only. On an unclaimed node
-  these return `403 claim_required`: Wi-Fi, updates and power are Home Assistant
-  features.
+  these return `403 claim_required`: updates and power are Home Assistant features.
 - **open:** anyone, even on a claimed node.
 
 A request that carries an `Authorization` header over HTTP is refused with
@@ -175,7 +207,6 @@ network in the clear.
 | `POST /node/reboot` | token | reboot the Pi |
 | `POST /node/shutdown` | token | power the Pi off |
 | `POST /node/update` | token | install another release |
-| `POST /wifi` | token | join a Wi-Fi network, with rollback |
 
 Commands return once the node has acted, with `{"ok": true}` or an
 [error](#errors). The resulting state arrives as an SSE event; a client never needs to
@@ -193,6 +224,7 @@ poll.
   "state": "claimed",
   "claim": "open",
   "claimed_by": "homeassistant.local",
+  "area": "Bathroom",
   "phones": "onboard",
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
           "paired": true, "connected": true}
@@ -210,6 +242,7 @@ otherwise. **No response ever contains a password, a key or the token** (except
 ```
 
 - `200` → `{"token": "…"}`. `409 already_claimed` if the node is claimed.
+  `409 claim_token_invalid` if a planted token file is there but unusable.
 - HTTPS only. Over HTTP it returns `403 https_required`.
 - The node id stays the MAC-derived `id`. `name` sets the display name (and the AirPlay
   name); `area` is only stored and returned for HA. So a later rename never re-keys
@@ -247,8 +280,7 @@ stream (`text/event-stream`):
   "node": {"name": "Bathroom Speaker", "version": "0.0.2",
            "update": {"state": "idle", "version": null, "phase_name": null,
                       "reason": null, "message": null, "rolled_back": false}},
-  "network": {"link": "wifi", "ssid": "Home", "signal": 71, "ip": "192.168.1.42",
-              "change": {"state": "idle", "ssid": null, "reason": null}},
+  "network": {"link": "wifi", "ssid": "Home", "signal": 71, "ip": "192.168.1.42"},
   "amp": {"mac": "F4:4E:FD:00:00:00", "name": "Kohler Amplifier",
           "paired": true, "connected": true, "auto_reconnect": true,
           "last_result": {"ok": true, "error": null, "at": "2026-10-02T15:40:12-07:00"}},
@@ -272,12 +304,12 @@ stream (`text/event-stream`):
 |---|---|
 | `source` | `airplay`, `bluetooth`, `both` or `idle` |
 | `now_playing.*.status` | `playing`, `paused` or `idle`. A source that goes idle clears its track fields |
-| `now_playing.bluetooth` | `duration` and `position` in milliseconds when the phone reports them; `device` is the phone's MAC |
+| `now_playing.bluetooth` | `duration` and `position` in milliseconds when the phone reports them; `device` is the phone's name (its roster name, else its Bluetooth name), for display. Match on a phone by `phones.devices[].mac` |
 | `amp` | `null` before pairing |
 | `amp.last_result`, `devices[].last_result` | the most recent connect or disconnect attempt: `ok`, BlueZ's error name if it failed, and when |
 | `phones.pairing` | `until` is when the window closes; `last_paired` is the MAC of the last phone paired in it |
 | `network.link` | `wifi` or `ethernet`. `ssid` and `signal` (0–100) are `null` on Ethernet |
-| `network.change`, `node.update` | progress of a Wi-Fi change or an update; see below |
+| `node.update` | progress of an update; see below |
 
 **No volume.** speakerd has no volume control. Volume follows the sender: the phone or
 Mac sets it, and it reaches the Kohler over AVRCP. The amp has no absolute volume, so a
@@ -340,7 +372,7 @@ level can't be set from outside. A relative step may come later.
 ### `PUT /node/name`
 
 - Body `{"name": "Bathroom Speaker"}`, 1–40 characters, with no quotes, backslashes,
-  `/` or `&`.
+  `/`, `&` or control characters (a newline would break shairport-sync's config).
 - Renames the AirPlay receiver, the Bluetooth name and the zeroconf instance. The `id`
   and `mac` never change.
 - shairport-sync restarts, so AirPlay drops for a few seconds.
@@ -360,12 +392,14 @@ level can't be set from outside. A relative step may come later.
   any other change.
 - `409 busy` if an install or update is already running.
 - `409 downgrade` if `version` is lower than the installed one. The same version is
-  allowed and reinstalls it, as a repair.
+  allowed and reinstalls it, as a repair. The update unit checks this again as root,
+  and records `failed` / `downgrade` in `install.json` if a request ever gets past
+  the API.
 
 **How it works:**
 1. speakerd writes the request to `/var/lib/nowairplaying/update/request.json`.
-2. speakerd starts the fixed system unit `nowairplaying-update.service`. A polkit rule
-   lets `nowairplaying` start that one unit and nothing else.
+2. The API service starts the fixed system unit `nowairplaying-update.service`. A
+   polkit rule lets `nowairplaying-api` start that one unit and nothing else.
 3. The unit runs as root.
    - It reads the request and checks `version` against `N.N.N` and `sha256` against 64
      lowercase hex characters.
@@ -386,26 +420,6 @@ reads the outcome from `node.update`.
 
 **Home Assistant's Update entity** compares `node.version` with the integration's pin.
 Installing calls this endpoint.
-
-### `POST /wifi`
-
-- Body: `{"ssid": "Home", "psk": "…", "hidden": false}`. `psk` may be omitted for an open
-  network. `202` → `{"ok": true}`.
-- **Effect:**
-  1. speakerd adds a NetworkManager connection for the new network and activates it. The
-     old connection is kept.
-  2. Within 60 seconds the node must get an address and reach its gateway.
-  3. **If it does,** the new connection becomes the preferred one, and the old one is
-     kept as a fallback.
-  4. **If it doesn't,** the node switches back to the old connection and deletes the new
-     one.
-- Wi-Fi is the node's only link, and it has no screen, so rollback is the default.
-- `network.change.state` goes `testing`, then `done` or `rolled_back`, with `reason`
-  (`no_address`, `no_gateway`, `auth_failed` or `not_found`).
-- **The connection drops during the test.** If the new network is a different LAN,
-  Home Assistant finds the node again through zeroconf, which is keyed by `mac`.
-- The node never returns the password, and never logs it.
-- On an Ethernet node it returns `409 no_wifi`.
 
 ### `GET /verify`
 
@@ -432,7 +446,7 @@ packages:
 | `no_mpris` | no `org.mpris.MediaPlayer2.*` player is on the session or system bus, and `mpris-proxy` isn't running |
 | `nqptp_active` | `nqptp.service` is active |
 | `mdns` | `avahi-daemon` runs and `/etc/nsswitch.conf` has `mdns4_minimal` |
-| `polkit_rules` | `/etc/polkit-1/rules.d/50-nowairplaying.rules` is present and matches the release |
+| `polkit_rules` | `/usr/share/polkit-1/rules.d/50-nowairplaying.rules` is present and is ours (it names the update unit) |
 | `speakerd_running` | the speakerd user service is active |
 | `amp_paired` | the configured amp is paired and trusted |
 | `amp_connected` | the amp is connected |
@@ -456,32 +470,90 @@ Every error is JSON: `{"error": "<code>", "message": "<human text>"}`.
 | 403 | `claim_required` | a **token** endpoint on an unclaimed node |
 | 404 | `not_found` | no such endpoint, no paired amp, or an unknown phone |
 | 409 | `already_claimed` | `/claim` on a claimed node |
-| 409 | `busy` | a scan, pair, update or Wi-Fi change is already running |
+| 409 | `claim_token_invalid` | `/claim` while a planted token file is unreadable or not 64 hex characters |
+| 409 | `busy` | a scan, pair or update is already running |
 | 409 | `downgrade` | `/node/update` to an older version |
-| 409 | `no_wifi` | `/wifi` on an Ethernet node |
-| 502 | `pair_failed`, `failed` | BlueZ, NetworkManager or systemd refused. `message` carries its error |
+| 502 | `pair_failed`, `failed` | BlueZ or systemd refused, or speakerd isn't running. `message` carries the error |
 
 ## Privileges
 
 The install runs as root once. It adds one rules file,
-`/etc/polkit-1/rules.d/50-nowairplaying.rules`. After that, **nothing of ours runs as
-root**: root system services act for `nowairplaying` on exactly these actions, and on
-nothing else.
+`/usr/share/polkit-1/rules.d/50-nowairplaying.rules` (readable by everyone, so the
+`polkit_rules` check can read it). After that, **nothing of ours runs as root**: root
+system services act for **`nowairplaying-api` only**, on exactly these actions:
 
 | Action | For |
 |---|---|
-| `org.freedesktop.NetworkManager.settings.modify.system`, `org.freedesktop.NetworkManager.network-control` | `/wifi` |
 | `org.freedesktop.systemd1.manage-units`, only with `unit` = `nowairplaying-update.service` and `verb` = `start` | `/node/update` |
 | `org.freedesktop.login1.reboot`, `org.freedesktop.login1.power-off`, and their `-multiple-sessions` variants | `/node/reboot`, `/node/shutdown` |
 
-- **Stock trixie's NetworkManager rule doesn't cover us.** It allows only a local,
-  active session of a `sudo` or `netdev` user. A background service has neither, so we
-  ship our own rule.
-- **The rules name only the `nowairplaying` account.** The login user and anything the
-  owner runs gets nothing new from them.
+- **Exact action ids and the exact account,** with no prefixes. `pkexec` isn't
+  installed.
+- **Why two accounts:** shairport-sync listens to the whole home network. A bug there
+  should reach the audio, not the update unit or reboot, so the audio account
+  (`nowairplaying`) holds no grants. speakerd can't trigger an update or a reboot, and
+  the API service only does either for a request with the claim token.
+- **The update unit trusts nothing but two fields** from the request file the API
+  account writes: `version` must match `N.N.N` and `sha256` 64 lowercase hex
+  characters, both checked before use and never passed through a shell. The download
+  address is built from the version, in the unit.
+- **Root never acts on a path either account controls.** The install and the update
+  unit read and write the audio account's home only as that account (`runuser`), so a
+  link planted there can't redirect a root write or read. In the API account's
+  `claim/` and `tls/` root never runs `chown` or `chmod`, which would follow a link; it
+  only creates missing files, and `install` replaces a link rather than writing through
+  it. The update unit refuses a `request.json` that is a link, and re-checks
+  `install.json`'s version (`N.N.N`) before it builds a rollback path from it.
+- **The login user and anything the owner runs** get nothing new from the rules.
 - **OS updates aren't done from Home Assistant.** The install turns on Debian's
   `unattended-upgrades` for security updates. Our two packages are apt-held, so those
   updates never replace them.
+
+## Wi-Fi
+
+No account the API runs as can change networking (agreed 2026-10-02): NetworkManager's
+polkit actions can't be limited to Wi-Fi. A new network is added **alongside** the
+current one, never instead of it, so nothing is switched: NetworkManager uses whichever
+known network is in range. A changed router is picked up on its own.
+
+**From Home Assistant, over SSH:** "Add Wi-Fi network" asks for the Pi's password once,
+then runs:
+
+```sh
+sudo -S -k -p '' /usr/local/lib/nowairplaying/wifi-add.sh
+```
+
+with this on stdin: the sudo password as the first line, then the network, in the
+format below. Nothing goes on a command line, where every local user could read it.
+
+**From the SD card,** for a Pi that has dropped off the network: put a file named
+`nowairplaying-wifi.txt` on the boot partition (the small drive any computer shows).
+At boot, a root unit adds the network, then deletes the file whatever the outcome,
+since it holds a password. It's the same proof of ownership as the reset file: the card
+in someone's hand. Nothing on the network can trigger it.
+
+**The format, for both:**
+
+```
+ssid=Home Network
+password=the password
+hidden=yes
+```
+
+- One `key=value` per line. The value is everything after the first `=`, taken as is,
+  so nothing needs quoting.
+- `ssid` is required (1–32 bytes). `password` is 8–63 characters; leave the line out
+  for an open network. `hidden=yes` is optional, for a network that doesn't broadcast
+  its name.
+- Blank lines and lines starting with `#` are skipped. A Windows editor's BOM and CRLF
+  line ends are fine.
+- Adding the same SSID again replaces the earlier profile it made.
+
+**Output:** one line, `ok: added 'Home Network'` or `error: …`. Exit status 0 when
+added, 2 for bad input, 1 when NetworkManager refused.
+
+**An Ethernet cable is the last fallback:** plug the Pi into the router for a minute,
+then add the network from Home Assistant.
 
 ## MQTT
 
@@ -511,9 +583,8 @@ and every phone and browser shows a full-screen warning for one. For a beginner'
 contact with the device, that's the wrong message. The page never handles a token, so
 HTTP costs nothing there.
 
-## Open questions
+## Settled questions
 
-1. **For Home Assistant:** the certificate-change repair (re-claim through the reset
-   file). Is that acceptable, or should there be a re-pin flow over SSH?
-
-**Settled:** the setup page is at `:8080` (the owner, 2026-10-02).
+- **The setup page is at `:8080`** (the owner, 2026-10-02).
+- **A changed certificate is re-pinned over SSH** with Reconnect; the reset file is
+  only the fallback (the owner, 2026-10-02).

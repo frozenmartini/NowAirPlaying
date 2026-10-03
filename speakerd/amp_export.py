@@ -483,6 +483,11 @@ class AmpMetadataExport:
                             adapter_path, e, REGISTER_RETRY_S)
                 await asyncio.sleep(REGISTER_RETRY_S)
 
+    @property
+    def registered(self) -> bool:
+        """Is speakerd's player registered on the amp's adapter right now."""
+        return self._registered
+
     def _set_registered(self, value: bool) -> None:
         self._player.registered = value
         if value != self._registered:

@@ -1,0 +1,42 @@
+# System unit: the node API (docs/SETUP-API.md) that Home Assistant and the
+# node's own setup page call -- HTTPS on 8443, the plain setup page on 8080.
+# Runs as its own account, "nowairplaying-api", not "nowairplaying": the
+# audio stack's account holds no polkit grants at all, because
+# shairport-sync listens to the whole LAN, so it must not be the thing that
+# can trigger a reboot, an update or anything else root-owned.
+# "nowairplaying-api" is polkit's only subject (polkit/50-nowairplaying.rules).
+#
+# It talks to speakerd over the local control socket speakerd (as
+# nowairplaying) listens on, /run/nowairplaying/speakerd.sock
+# (/etc/tmpfiles.d/nowairplaying.conf), never by sharing speakerd's account
+# or files directly.
+#
+# install/install.sh installs and (re)starts this at the end of phase 5,
+# "configure", after speakerd: on a change to this file or to speakerd's
+# Python code (the same tree), when a certificate was just (re)generated, or
+# when it simply isn't running.
+
+[Unit]
+Description=NowAirPlaying node API (HTTPS for Home Assistant, HTTP setup page)
+After=network.target avahi-daemon.service
+Wants=avahi-daemon.service
+
+[Service]
+Type=simple
+User=nowairplaying-api
+Group=nowairplaying-api
+Environment=PYTHONPATH=/opt/nowairplaying
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m speakerd.apiserver
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=-/var/lib/nowairplaying-api -/var/lib/nowairplaying/claim -/var/lib/nowairplaying/update
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

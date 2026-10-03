@@ -9,6 +9,13 @@ Publishing goes through a `sink` object providing:
     device_changed(slug: str, connected: bool)
     streaming_changed(on: bool)            # already debounced here
     now_playing_changed(payload: dict)
+    devices_changed()                      # the adapter's device list changed
+    bluez_ready()                          # after every full rescan
+
+Two views of devices: the roster's (the amp and config.toml's [[devices]]),
+which get per-device connect state and auto-reconnect; and every device on
+our adapter (`devices()`), which is where phones, the scan list and the amp's
+paired state come from. BlueZ's bond list is the source of truth for phones.
 """
 from __future__ import annotations
 
@@ -16,10 +23,11 @@ import asyncio
 import logging
 import re
 
-from dbus_next import BusType, Message, MessageType
+from dbus_next import BusType, Message, MessageType, Variant
 from dbus_next.aio import MessageBus
 
 from .config import Config
+from .roster import Roster
 
 log = logging.getLogger("speakerd.bluez")
 
@@ -29,6 +37,15 @@ PROPS_IFACE = "org.freedesktop.DBus.Properties"
 DEVICE_IFACE = "org.bluez.Device1"
 TRANSPORT_IFACE = "org.bluez.MediaTransport1"
 PLAYER_IFACE = "org.bluez.MediaPlayer1"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
+
+# Device1 properties kept for every device on our adapter; RSSI churns during
+# a scan and is not worth a devices_changed() on its own
+_DEVICE_PROPS = ("Address", "Alias", "Name", "Paired", "Trusted", "Connected",
+                 "RSSI", "Class", "UUIDs")
+_QUIET_PROPS = {"RSSI"}
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
 
 _DEV_PATH_RE = re.compile(r"/dev_((?:[0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2})")
 
@@ -43,10 +60,14 @@ def _mac_from_path(path: str) -> str | None:
 
 
 class BluezEngine:
-    def __init__(self, cfg: Config, sink):
+    def __init__(self, cfg: Config, sink, roster: Roster | None = None):
         self._cfg = cfg
         self._sink = sink
+        self._roster = roster if roster is not None else Roster(cfg)
         self._bus: MessageBus | None = None
+        self._adapter_path = f"/org/bluez/{cfg.adapter}"
+        # path -> {prop: value} for every device on our adapter
+        self._devices: dict[str, dict] = {}
 
         # mac -> {path: connected} (a device can exist on several adapters)
         self._dev_paths: dict[str, dict[str, bool]] = {}
@@ -112,6 +133,7 @@ class BluezEngine:
             self._dev_paths.clear()
             self._transports.clear()
             self._players.clear()
+            self._devices.clear()
             for path, ifaces in objects.items():
                 self._ingest(path, ifaces)
             buffered = self._sig_buffer
@@ -123,6 +145,16 @@ class BluezEngine:
                  sum(len(v) for v in self._dev_paths.values()),
                  len(self._transports), len(self._players))
         self._publish_all(force=True)
+        self._notify("devices_changed")
+        self._notify("bluez_ready")
+
+    def _notify(self, name: str) -> None:
+        cb = getattr(self._sink, name, None)
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                log.exception("sink %s failed", name)
 
     # ------------------------------------------------------------- ingestion
 
@@ -130,20 +162,25 @@ class BluezEngine:
         dev = ifaces.get(DEVICE_IFACE)
         if dev is not None and "Address" in dev:
             mac = str(dev["Address"].value).upper()
-            if mac in self._cfg.by_mac:
+            if mac in self._roster.by_mac:
                 connected = bool(dev["Connected"].value) if "Connected" in dev else False
                 self._dev_paths.setdefault(mac, {})[path] = connected
+            if path.startswith(self._adapter_path + "/"):
+                self._devices[path] = {k: _plain(dev[k].value) for k in _DEVICE_PROPS
+                                       if k in dev}
 
+        # transports and players: any device on the adapter. Phones paired
+        # over the API are sources too, not only config.toml's [[devices]]
         if TRANSPORT_IFACE in ifaces:
             mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac:
+            if mac is not None:
                 state = str(ifaces[TRANSPORT_IFACE].get("State").value) \
                     if ifaces[TRANSPORT_IFACE].get("State") else "idle"
                 self._transports[path] = (mac, state)
 
         if PLAYER_IFACE in ifaces:
             mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac:
+            if mac is not None:
                 props = ifaces[PLAYER_IFACE]
                 self._seq += 1
                 self._players[path] = {
@@ -193,21 +230,33 @@ class BluezEngine:
                           msg.interface, msg.member, msg.path)
 
     def _on_props_changed(self, path: str, iface: str, changed: dict) -> None:
-        if iface == DEVICE_IFACE and "Connected" in changed:
-            mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac:
-                self._dev_paths.setdefault(mac, {})[path] = bool(changed["Connected"].value)
-                self._publish_device(mac)
+        if iface == DEVICE_IFACE:
+            entry = self._devices.get(path)
+            if entry is not None:
+                loud = False
+                for k in _DEVICE_PROPS:
+                    if k in changed:
+                        v = _plain(changed[k].value)
+                        if entry.get(k) != v:
+                            entry[k] = v
+                            loud = loud or k not in _QUIET_PROPS
+                if loud:
+                    self._notify("devices_changed")
+            if "Connected" in changed:
+                mac = _mac_from_path(path)
+                if mac in self._roster.by_mac:
+                    self._dev_paths.setdefault(mac, {})[path] = bool(changed["Connected"].value)
+                    self._publish_device(mac)
 
         elif iface == TRANSPORT_IFACE and "State" in changed:
             mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac:
+            if mac is not None:
                 self._transports[path] = (mac, str(changed["State"].value))
                 self._recompute_streaming()
 
         elif iface == PLAYER_IFACE:
             mac = _mac_from_path(path)
-            if mac not in self._cfg.by_mac:
+            if mac is None:
                 return
             player = self._players.get(path)
             if player is None:
@@ -233,8 +282,10 @@ class BluezEngine:
         self._ingest(path, ifaces)
         if DEVICE_IFACE in ifaces:
             mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac:
+            if mac in self._roster.by_mac:
                 self._publish_device(mac)
+            if path in self._devices:
+                self._notify("devices_changed")
         if TRANSPORT_IFACE in ifaces:
             self._recompute_streaming()
         if PLAYER_IFACE in ifaces:
@@ -243,9 +294,11 @@ class BluezEngine:
     def _on_interfaces_removed(self, path: str, ifaces: list) -> None:
         if DEVICE_IFACE in ifaces:
             mac = _mac_from_path(path)
-            if mac in self._cfg.by_mac and mac in self._dev_paths:
+            if mac in self._roster.by_mac and mac in self._dev_paths:
                 self._dev_paths[mac].pop(path, None)
                 self._publish_device(mac)
+            if self._devices.pop(path, None) is not None:
+                self._notify("devices_changed")
         if TRANSPORT_IFACE in ifaces and path in self._transports:
             del self._transports[path]
             self._recompute_streaming()
@@ -263,12 +316,14 @@ class BluezEngine:
             self._dev_paths.clear()
             self._transports.clear()
             self._players.clear()
+            self._devices.clear()
             self._publish_all(force=False)
+            self._notify("devices_changed")
 
     # ------------------------------------------------------------- publishing
 
     def _publish_all(self, force: bool) -> None:
-        for dev in self._cfg.all_devices:
+        for dev in self._roster.all_devices:
             self._publish_device(dev.mac, force=force)
         self._recompute_streaming()
         if force:
@@ -280,10 +335,13 @@ class BluezEngine:
         connected = any(self._dev_paths.get(mac, {}).values())
         if force or self._connected.get(mac) != connected:
             self._connected[mac] = connected
-            self._sink.device_changed(self._cfg.by_mac[mac].slug, connected)
+            self._sink.device_changed(self._roster.by_mac[mac].slug, connected)
 
     def _recompute_streaming(self) -> None:
-        val = any(mac in self._cfg.ios_macs and state in STREAMING_STATES
+        # every device but the amp is a source: the amp's own transport is the
+        # Pi streaming TO it, not a phone streaming to the Pi
+        amp = self._roster.amp_mac
+        val = any(mac != amp and state in STREAMING_STATES
                   for mac, state in self._transports.values())
         self._streaming_current = val
         if self._streaming_task is not None:
@@ -309,10 +367,12 @@ class BluezEngine:
             self._sink.streaming_changed(False)
 
     def _current_player(self) -> dict | None:
-        if not self._players:
+        amp = self._roster.amp_mac
+        players = [p for p in self._players.values() if p["mac"] != amp]
+        if not players:
             return None
-        playing = [p for p in self._players.values() if p["status"] == "playing"]
-        pool = playing or list(self._players.values())
+        playing = [p for p in players if p["status"] == "playing"]
+        pool = playing or players
         return max(pool, key=lambda p: p["seq"])
 
     def _publish_now_playing(self, force: bool = False) -> None:
@@ -331,7 +391,7 @@ class BluezEngine:
                 "album": track.get("Album"),
                 "duration": track.get("Duration"),
                 "position": p["position"],
-                "device": self._cfg.by_mac[p["mac"]].name,
+                "device": self._device_name(p["mac"]),
             }
             key = (p["status"], payload["title"], payload["artist"],
                    payload["album"], payload["device"])
@@ -373,11 +433,11 @@ class BluezEngine:
             return False, str(e)
 
     async def _device_call(self, slug: str, member: str) -> tuple[bool, str | None]:
-        dev = self._cfg.by_slug.get(slug)
+        dev = self._roster.by_slug.get(slug)
         if dev is None:
             return False, f"unknown device {slug!r}"
         paths = sorted(self._dev_paths.get(dev.mac, {}))
-        path = paths[0] if paths else f"/org/bluez/{self._cfg.adapter}/dev_{dev.dbus_mac}"
+        path = paths[0] if paths else self.device_path(dev.mac)
         log.info("%s %s (%s)", member, dev.name, path)
         try:
             await self._call(BLUEZ, path, DEVICE_IFACE, member, timeout=CONNECT_TIMEOUT_S)
@@ -385,6 +445,109 @@ class BluezEngine:
         except _DBusCallError as e:
             log.warning("%s %s failed: %s", member, dev.name, e)
             return False, str(e)
+
+    # ------------------------------------------------------ all devices, adapter
+
+    def device_path(self, mac: str) -> str:
+        return f"{self._adapter_path}/dev_{mac.upper().replace(':', '_')}"
+
+    def _device_name(self, mac: str) -> str | None:
+        dev = self._roster.by_mac.get(mac)
+        if dev is not None:
+            return dev.name
+        entry = self._devices.get(self.device_path(mac))
+        return (entry or {}).get("Alias") or (entry or {}).get("Name")
+
+    def devices(self) -> list[dict]:
+        """Every device on our adapter: mac, name, paired, trusted, connected,
+        rssi, likely_amp (an audio sink, as a sorting hint only)."""
+        out = []
+        for entry in self._devices.values():
+            mac = str(entry.get("Address", "")).upper()
+            if not mac:
+                continue
+            cls = entry.get("Class")
+            uuids = [str(u).lower() for u in entry.get("UUIDs") or ()]
+            out.append({
+                "mac": mac,
+                "name": entry.get("Alias") or entry.get("Name"),
+                "paired": bool(entry.get("Paired")),
+                "trusted": bool(entry.get("Trusted")),
+                "connected": bool(entry.get("Connected")),
+                "rssi": entry.get("RSSI"),
+                # major device class 0x04 = audio/video
+                "likely_amp": (A2DP_SINK_UUID in uuids
+                               or (isinstance(cls, int) and (cls >> 8) & 0x1F == 0x04)),
+            })
+        return sorted(out, key=lambda d: d["mac"])
+
+    def device(self, mac: str) -> dict | None:
+        mac = mac.upper()
+        return next((d for d in self.devices() if d["mac"] == mac), None)
+
+    async def roster_changed(self) -> None:
+        """The amp was paired or forgotten: rebuild everything from BlueZ."""
+        self._connected = {m: v for m, v in self._connected.items()
+                           if m in self._roster.by_mac}
+        await self.rescan()
+
+    async def get_adapter(self, prop: str):
+        reply = await self._call(BLUEZ, self._adapter_path, PROPS_IFACE, "Get", "ss",
+                                 [ADAPTER_IFACE, prop])
+        return _plain(reply.body[0].value)
+
+    async def set_adapter(self, prop: str, signature: str, value) -> None:
+        await self._set(self._adapter_path, ADAPTER_IFACE, prop, signature, value)
+
+    async def set_device(self, mac: str, prop: str, signature: str, value) -> None:
+        await self._set(self.device_path(mac), DEVICE_IFACE, prop, signature, value)
+
+    async def _set(self, path: str, iface: str, prop: str, signature: str, value) -> None:
+        await self._call(BLUEZ, path, PROPS_IFACE, "Set", "ssv",
+                         [iface, prop, Variant(signature, value)])
+
+    async def start_discovery(self) -> None:
+        try:
+            await self._call(BLUEZ, self._adapter_path, ADAPTER_IFACE, "SetDiscoveryFilter",
+                             "a{sv}", [{"Transport": Variant("s", "bredr")}])
+        except _DBusCallError as e:
+            log.warning("SetDiscoveryFilter failed (%s) — scanning unfiltered", e)
+        await self._call(BLUEZ, self._adapter_path, ADAPTER_IFACE, "StartDiscovery")
+
+    async def stop_discovery(self) -> None:
+        try:
+            await self._call(BLUEZ, self._adapter_path, ADAPTER_IFACE, "StopDiscovery")
+        except _DBusCallError as e:
+            log.info("StopDiscovery: %s", e)  # already stopped
+
+    async def device_method(self, mac: str, member: str,
+                            timeout: float = CONNECT_TIMEOUT_S) -> tuple[bool, str | None]:
+        """Pair / Connect / Disconnect / CancelPairing on any device by MAC."""
+        try:
+            await self._call(BLUEZ, self.device_path(mac), DEVICE_IFACE, member,
+                             timeout=timeout)
+            return True, None
+        except _DBusCallError as e:
+            log.warning("%s %s failed: %s", member, mac, e)
+            return False, str(e)
+
+    async def remove_device(self, mac: str) -> tuple[bool, str | None]:
+        try:
+            await self._call(BLUEZ, self._adapter_path, ADAPTER_IFACE, "RemoveDevice", "o",
+                             [self.device_path(mac)])
+            return True, None
+        except _DBusCallError as e:
+            return False, str(e)
+
+    async def register_agent(self, path: str, capability: str) -> None:
+        await self._call(BLUEZ, "/org/bluez", AGENT_MANAGER_IFACE, "RegisterAgent", "os",
+                         [path, capability])
+        await self._call(BLUEZ, "/org/bluez", AGENT_MANAGER_IFACE, "RequestDefaultAgent",
+                         "o", [path])
+
+    @property
+    def bus(self) -> MessageBus | None:
+        return self._bus
 
     # ------------------------------------------------------------- low level
 
@@ -411,5 +574,17 @@ class BluezEngine:
         return reply
 
 
+def _plain(v):
+    """A D-Bus value with any Variant wrapping removed, lists as tuples."""
+    if isinstance(v, Variant):
+        v = v.value
+    if isinstance(v, list):
+        return tuple(_plain(x) for x in v)
+    return v
+
+
 class _DBusCallError(Exception):
     pass
+
+
+DBusCallError = _DBusCallError

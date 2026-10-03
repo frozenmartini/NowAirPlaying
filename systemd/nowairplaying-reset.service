@@ -1,0 +1,26 @@
+# System unit: turns a boot-partition reset file into a request the node
+# API can consume. docs/SETUP-API.md "Releasing a claim": with the Pi off, a
+# file named "nowairplaying-reset" dropped on the boot partition clears the
+# claim on the next boot, with no Home Assistant and no sudo.
+#
+# The API service (nowairplaying-api.service) reads and removes
+# reset-request itself, so this fixed one-shot only has to run, and finish,
+# before that unit starts -- a plain Before=, no need for the
+# systemd-user-sessions.service workaround a lingered user session would
+# have needed.
+[Unit]
+Description=NowAirPlaying: turn a boot-partition reset file into a reset request
+ConditionPathExists=/boot/firmware/nowairplaying-reset
+DefaultDependencies=no
+Before=nowairplaying-api.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+# nowairplaying-api consumes and removes reset-request itself.
+ExecStart=/usr/bin/install -o nowairplaying-api -g nowairplaying-api -m 0644 /dev/null /var/lib/nowairplaying-api/reset-request
+ExecStart=/usr/bin/rm -f /boot/firmware/nowairplaying-reset
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

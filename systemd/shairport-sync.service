@@ -1,8 +1,9 @@
-# User unit (linger on): runs in the user's PipeWire session and owns
-# org.gnome.ShairportSync on the user's session bus for speakerd.
-# Needs the system nqptp service for AirPlay 2 timing. A user unit cannot
-# order itself after a system unit, so with service_type = "airplay2" a start
-# before nqptp is up exits and Restart=on-failure retries it.
+# User unit of the nowairplaying account (linger on): runs in the user's
+# PipeWire session and owns org.gnome.ShairportSync on the user's session bus
+# for speakerd. Needs the system nqptp service for AirPlay 2 timing. A user
+# unit cannot order itself after a system unit, so with service_type =
+# "airplay2" a start before nqptp is up exits and Restart=on-failure retries
+# it.
 
 [Unit]
 Description=shairport-sync AirPlay 2 receiver (NowAirPlaying)
@@ -14,6 +15,8 @@ Type=simple
 ExecStart=/usr/bin/shairport-sync -c %h/.config/shairport-sync.conf
 Restart=on-failure
 RestartSec=10
+CPUWeight=500
+MemoryMin=64M
 
 [Install]
 WantedBy=default.target
