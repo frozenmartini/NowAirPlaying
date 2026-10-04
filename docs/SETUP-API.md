@@ -147,7 +147,16 @@ the network can publish a TXT record.
     - **A planted file the API can't use locks the claim, it never opens it.** One it
       can't read, or that isn't 64 hex characters, makes `/claim` return
       `409 claim_token_invalid`, and `/info` still reports `"claim": "token"`.
-    - `/claim` then needs `Authorization: Bearer <the 64-hex bytes>`.
+    - `/claim` then needs `Authorization: Bearer <hex>`, where `<hex>` is the 32 random
+      bytes themselves in hex, **never the file's contents**. The node hashes the raw
+      bytes, not the hex text. Both strings are 64 hex characters, so they are easy to
+      swap:
+
+      ```python
+      raw = secrets.token_bytes(32)
+      plant = hashlib.sha256(raw).hexdigest()  # → the claim-token file
+      bearer = raw.hex()                       # → Authorization: Bearer <bearer>
+      ```
     - The file is read on **every** `/claim` request, never once at startup. Whitespace
       around its contents is ignored.
     - A successful claim deletes it, before anything is claimed.
